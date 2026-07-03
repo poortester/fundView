@@ -1,4 +1,5 @@
 import { defineConfig } from 'vite'
+import tailwindcss from '@tailwindcss/vite'
 import { spawn } from 'node:child_process'
 import net from 'node:net'
 import path from 'node:path'
@@ -7,7 +8,7 @@ function autoStartBackend() {
   return {
     name: 'auto-start-backend',
     configureServer() {
-      const port = 4001
+      const port = Number(process.env.API_PORT ?? 4001)
       const host = '127.0.0.1'
       const client = net.connect({ port, host }, () => {
         console.log(`[AutoStart] Backend is already running on ${host}:${port}`)
@@ -36,12 +37,12 @@ function autoStartBackend() {
 }
 
 export default defineConfig({
-  plugins: [autoStartBackend()],
+  plugins: [tailwindcss(), autoStartBackend()],
   server: {
     host: '127.0.0.1',
     port: 4000,
     proxy: {
-      '/api': 'http://127.0.0.1:4001',
+      '/api': `http://127.0.0.1:${process.env.API_PORT ?? 4001}`,
     },
   },
 })

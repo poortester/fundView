@@ -1058,11 +1058,11 @@ async function runFundAgents(params) {
   const apiKey = process.env.LLM_API_KEY
 
   const agentDefs = [
-    { id: 'market', title: '市场情绪智能体', role: '分析整体市场环境对这只基金的影响' },
-    { id: 'sector', title: '板块动量智能体', role: '分析基金重仓板块的资金流向和动量' },
-    { id: 'risk', title: '风控智能体', role: '评估仓位风险、回撤、波动率，并给出风险等级' },
-    { id: 'news', title: '消息面智能体', role: '分析快讯和公告对这只基金的潜在影响' },
-    { id: 'trade', title: '交易决策智能体', role: '综合以上所有信息，给出明确操作建议' },
+    { id: 'market', title: '市场研究员', role: '评估宏观指数、市场宽度和基准相对表现，只说明对本基金的影响路径' },
+    { id: 'sector', title: '行业研究员', role: '评估基金重仓行业、板块动量和资金流，不夸大未验证的主题叙事' },
+    { id: 'risk', title: '组合风控研究员', role: '评估仓位、回撤、波动和集中度，明确风险等级与观察阈值' },
+    { id: 'news', title: '事件研究员', role: '核对快讯和公告，只标记需要人工确认的事件风险' },
+    { id: 'trade', title: '组合决策研究员', role: '综合研究结论，输出持有、观察、减仓观察或补仓观察，不输出确定性交易指令' },
   ]
 
   if (apiKey) {
@@ -1085,7 +1085,7 @@ async function runSingleAgent(agentDef, ctx, apiKey) {
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({
         model,
-        messages: [{ role: 'system', content: '浣犳槸涓撲笟鐨勫熀閲戞姇椤炬櫤鑳戒綋銆傚熀浜庢暟鎹粰鍑哄垎鏋愶紝涓嶈缂栭€犳暟鎹€傝緭鍑篔SON锛歿"level":"positive/negative/watch/neutral","conclusion":"涓€鍙ヨ瘽缁撹","evidence":["渚濇嵁1","渚濇嵁2"]}' }, { role: 'user', content: prompt }],
+        messages: [{ role: 'system', content: '你是研究员级别的基金投研助手。只能基于输入数据做可追溯分析；禁止编造数据、禁止保证收益、禁止给确定性买卖指令。输出必须是严格 JSON：{"level":"positive/negative/watch/neutral","conclusion":"一句研究结论，包含动作倾向和限制条件","evidence":["可核验依据1","可核验依据2","可核验依据3"]}' }, { role: 'user', content: prompt }],
         max_tokens: 400,
         temperature: 0.4,
       }),
@@ -1123,7 +1123,8 @@ function buildAgentPrompt(agentDef, ctx) {
   if (ctx.sectorLeaders.length) lines.push(`板块资金：${ctx.sectorLeaders.join('、')}`)
   if (ctx.matchedNews.length) lines.push(`相关快讯：${ctx.matchedNews.join('；')}`)
   if (ctx.latestAnnouncement) lines.push(`最新公告：${ctx.latestAnnouncement}`)
-  lines.push(`你的角色：${agentDef.role}`)
+  lines.push(`研究员职责：${agentDef.role}`)
+  lines.push('输出要求：像投研备忘录，不像聊天；结论必须有条件边界；证据必须来自上面的数据。')
   return lines.join('\n')
 }
 
