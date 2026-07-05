@@ -1,6 +1,6 @@
 {
-  "name": "my_trade",
-  "private": true,
+  "name": "trading-agent",
+  "private": false,
   "version": "0.0.0",
   "type": "module",
   "scripts": {
@@ -8,7 +8,8 @@
     "dev": "concurrently \"npm run api\" \"vite\"",
     "db:init": "node scripts/init-db.mjs",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "audit:deps": "npm audit --omit=dev"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.2",
@@ -30,5 +31,7 @@
     "multer": "^2.2.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7"
-  }
+  },
+  "description": "A local-first fund valuation and research dashboard.",
+  "license": "Apache-2.0"
 }

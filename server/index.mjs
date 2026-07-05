@@ -1,8 +1,9 @@
-﻿import { createClient } from '@libsql/client'
+import { createClient } from '@libsql/client'
 import { config } from 'dotenv'
 import express from 'express'
 import multer from 'multer'
 import { randomUUID } from 'node:crypto'
+import { readFile, writeFile } from 'node:fs/promises'
 
 config({ path: '.env.local' })
 
@@ -11,6 +12,7 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 *
 const port = Number(process.env.API_PORT ?? 4001)
 const userId = 'demo-user'
 const tradeDate = resolveTradeDate()
+const llmSettingsUrl = new URL('../llm-settings.local.json', import.meta.url)
 
 const db = createClient({
   url: requiredEnv('TURSO_DATABASE_URL'),
@@ -20,6 +22,47 @@ const db = createClient({
 app.use(express.json({ limit: '1mb' }))
 
 app.get('/api/health', (_request, response) => response.json({ ok: true }))
+
+app.get('/api/settings/llm', async (_request, response, next) => {
+  try {
+    response.json(sanitizeLlmSettings(await readLlmSettings()))
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/settings/llm/providers', async (request, response, next) => {
+  try {
+    const settings = await readLlmSettings()
+    const provider = normalizeLlmProvider(request.body)
+    const existing = settings.providers.find((item) => item.id === provider.id)
+    if (existing && !provider.apiKey) provider.apiKey = existing.apiKey
+    settings.providers = existing
+      ? settings.providers.map((item) => item.id === provider.id ? { ...item, ...provider } : item)
+      : [...settings.providers, provider]
+    if (request.body?.active !== false) settings.activeProviderId = provider.id
+    await writeLlmSettings(settings)
+    response.json(sanitizeLlmSettings(settings))
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.patch('/api/settings/llm/active', async (request, response, next) => {
+  try {
+    const settings = await readLlmSettings()
+    const providerId = cleanString(request.body?.providerId)
+    const model = cleanString(request.body?.model)
+    const provider = settings.providers.find((item) => item.id === providerId)
+    if (!provider) return response.status(404).json({ message: '妯″瀷閰嶇疆涓嶅瓨鍦? })
+    if (model) provider.selectedModel = model
+    settings.activeProviderId = providerId
+    await writeLlmSettings(settings)
+    response.json(sanitizeLlmSettings(settings))
+  } catch (error) {
+    next(error)
+  }
+})
 
 app.get('/api/dashboard', async (_request, response, next) => {
   try {
@@ -36,7 +79,7 @@ app.post('/api/funds', async (request, response, next) => {
     await ensureSeedData()
     const code = cleanString(request.body?.code)
     const name = cleanString(request.body?.name)
-    if (!code && !name) return response.status(400).json({ message: '璇疯緭鍏ュ熀閲戜唬鐮佹垨鍚嶇О' })
+    if (!code && !name) return response.status(400).json({ message: '鐠囩柉绶崗銉ョ唨闁叉垳鍞惍浣瑰灗閸氬秶袨' })
 
     const fund = normalizeFundPayload({ ...request.body, code, name })
     let fundId = randomUUID()
@@ -47,7 +90,7 @@ app.post('/api/funds', async (request, response, next) => {
     if (/^\d{6}$/.test(fund.code)) {
       const fundData = await fetchEastmoneyFundNav(fund.code)
       const realtimeEstimate = await fetchFundRealtimeEstimate(fund.code).catch(() => null)
-      fund.name = fundData.name || fund.name || `鍩洪噾${fund.code}`
+      fund.name = fundData.name || fund.name || `閸╂椽鍣?{fund.code}`
       latestNav = realtimeEstimate?.estimatedNav ?? fundData.latest.nav
       latestChange = realtimeEstimate?.changePercent ?? fundData.latest.changePercent
     }
@@ -128,6 +171,37 @@ app.put('/api/funds/:id', async (request, response, next) => {
   }
 })
 
+async function updateFundsBulk(request, response, next) {
+  try {
+    await ensureSeedData()
+    const updates = request.body?.funds ?? []
+    const statements = []
+    for (const update of updates) {
+      const fund = normalizeFundPayload(update)
+      statements.push({
+        sql: `UPDATE funds
+              SET code = ?, name = ?, fund_type = ?, tags = ?, updated_at = datetime('now')
+              WHERE id = ?`,
+        args: [fund.code || createFundCode(), fund.name, fund.type, JSON.stringify(fund.tags), fund.id],
+      })
+      statements.push({
+        sql: `UPDATE holdings
+              SET shares = ?, avg_cost = ?, target_position_ratio = ?, updated_at = datetime('now')
+              WHERE user_id = ? AND fund_id = ?`,
+        args: [fund.shares, fund.cost, fund.positionRatio, userId, fund.id],
+      })
+      statements.push(latestNavStatement(fund.id, fund.nav, fund.estimateChange))
+    }
+    if (statements.length) await db.batch(statements, 'write')
+    response.json(await getDashboardData({ skipAnalysis: true }))
+  } catch (error) {
+    next(error)
+  }
+}
+
+app.post('/api/funds/batch', updateFundsBulk)
+app.put('/api/funds/bulk', updateFundsBulk)
+
 app.delete('/api/funds/:id', async (request, response, next) => {
   try {
     const fundId = request.params.id
@@ -150,7 +224,7 @@ app.post('/api/holdings/import-from-ocr', async (request, response, next) => {
       .map((item) => normalizeOcrImportHolding(item))
       .filter(Boolean)
       .map((item) => [item.code, item])).values()]
-    if (uniqueHoldings.length === 0) return response.status(400).json({ message: '娌℃湁鍙鍏ョ殑鍩洪噾浠ｇ爜' })
+    if (uniqueHoldings.length === 0) return response.status(400).json({ message: '濞屸剝婀侀崣顖氼嚤閸忋儳娈戦崺娲櫨娴狅絿鐖? })
 
     const resolvedHoldings = await Promise.all(uniqueHoldings.map((holding) => resolveOcrImportHolding(holding)))
     const statements = []
@@ -159,11 +233,11 @@ app.post('/api/holdings/import-from-ocr', async (request, response, next) => {
       statements.push(
         {
           sql: `INSERT OR IGNORE INTO funds (id, code, name, fund_type, tags) VALUES (?, ?, ?, ?, ?)`,
-          args: [fundId, resolved.code, resolved.name, resolved.type || 'OCR瀵煎叆', JSON.stringify(['OCR瀵煎叆'])],
+          args: [fundId, resolved.code, resolved.name, resolved.type || 'OCR鐎电厧鍙?, JSON.stringify(['OCR鐎电厧鍙?])],
         },
         {
           sql: `UPDATE funds SET name = ?, fund_type = ?, tags = ?, updated_at = datetime('now') WHERE code = ?`,
-          args: [resolved.name, resolved.type || 'OCR瀵煎叆', JSON.stringify(['OCR瀵煎叆']), resolved.code],
+          args: [resolved.name, resolved.type || 'OCR鐎电厧鍙?, JSON.stringify(['OCR鐎电厧鍙?]), resolved.code],
         },
         {
           sql: `INSERT INTO holdings (id, user_id, fund_id, shares, avg_cost, target_position_ratio, account_name)
@@ -263,7 +337,7 @@ app.patch('/api/advice/:id', async (request, response, next) => {
       sql: `UPDATE advice_items SET status = ?, baseline_nav = ?, executed_at = ?, updated_at = datetime('now') WHERE id = ?`,
       args: [status, baselineNav, status === 'executed' ? new Date().toISOString() : null, adviceId],
     })
-    response.json(await getDashboardData())
+    response.json({ ok: true })
   } catch (error) {
     next(error)
   }
@@ -298,10 +372,34 @@ app.get('/api/funds/:id/evidence', async (request, response, next) => {
   }
 })
 
+app.get('/api/funds/:id/analysis-history', async (request, response, next) => {
+  try {
+    await ensureSeedData()
+    response.json(await getFundAnalysisHistory(request.params.id))
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.patch('/api/advice/:id/verify', async (request, response, next) => {
+  try {
+    const adviceId = request.params.id
+    const verified = cleanString(request.body?.verified)
+    if (!['correct', 'incorrect', 'pending'].includes(verified)) return response.status(400).json({ message: 'verified must be correct/incorrect/pending' })
+    await db.execute({
+      sql: `UPDATE advice_items SET verified = ?, updated_at = datetime('now') WHERE id = ?`,
+      args: [verified, adviceId],
+    })
+    response.json({ ok: true })
+  } catch (error) {
+    next(error)
+  }
+})
+
 app.post('/api/ocr/position-screenshot', upload.single('image'), async (request, response, next) => {
   try {
-    if (!request.file) return response.status(400).json({ message: '请上传持仓截图' })
-    if (!request.file.mimetype.startsWith('image/')) return response.status(400).json({ message: '只支持图片文件' })
+    if (!request.file) return response.status(400).json({ message: '璇蜂笂浼犳寔浠撴埅鍥? })
+    if (!request.file.mimetype.startsWith('image/')) return response.status(400).json({ message: '鍙敮鎸佸浘鐗囨枃浠? })
     response.json(await recognizePositionScreenshot(request.file.buffer))
   } catch (error) {
     next(error)
@@ -310,7 +408,7 @@ app.post('/api/ocr/position-screenshot', upload.single('image'), async (request,
 
 app.use((error, _request, response, _next) => {
   console.error(error)
-  response.status(error.statusCode ?? 500).json({ message: error instanceof Error ? error.message : '服务器错误' })
+  response.status(error.statusCode ?? 500).json({ message: error instanceof Error ? error.message : '鏈嶅姟鍣ㄩ敊璇? })
 })
 
 app.listen(port, '127.0.0.1', () => {
@@ -328,6 +426,116 @@ function cleanString(value) {
   return String(value ?? '').trim()
 }
 
+async function readLlmSettings() {
+  let settings = { activeProviderId: '', providers: [] }
+  try {
+    settings = JSON.parse(await readFile(llmSettingsUrl, 'utf8'))
+  } catch {
+    settings = { activeProviderId: '', providers: [] }
+  }
+  if (!Array.isArray(settings.providers)) settings.providers = []
+
+  if (process.env.LLM_API_KEY && !settings.providers.some((item) => item.id === 'env-default')) {
+    settings.providers.unshift({
+      id: 'env-default',
+      provider: 'openai-compatible',
+      name: '鐜鍙橀噺榛樿妯″瀷',
+      baseUrl: process.env.LLM_BASE_URL || 'https://api.openai.com/v1',
+      apiKey: process.env.LLM_API_KEY,
+      models: [process.env.LLM_MODEL || 'gpt-4o-mini'],
+      selectedModel: process.env.LLM_MODEL || 'gpt-4o-mini',
+      source: 'env',
+    })
+    if (!settings.activeProviderId) settings.activeProviderId = 'env-default'
+  }
+
+  return settings
+}
+
+async function writeLlmSettings(settings) {
+  const persisted = {
+    activeProviderId: settings.activeProviderId || settings.providers[0]?.id || '',
+    providers: settings.providers.filter((item) => item.source !== 'env'),
+  }
+  await writeFile(llmSettingsUrl, `${JSON.stringify(persisted, null, 2)}\n`, 'utf8')
+}
+
+async function getActiveLlmConfig() {
+  const settings = await readLlmSettings()
+  const active = settings.providers.find((item) => item.id === settings.activeProviderId) ?? settings.providers[0]
+  if (!active?.apiKey) return null
+  return active
+}
+
+function sanitizeLlmSettings(settings) {
+  return {
+    activeProviderId: settings.activeProviderId || '',
+    providers: settings.providers.map((provider) => ({
+      id: provider.id,
+      provider: provider.provider,
+      name: provider.name,
+      baseUrl: provider.baseUrl,
+      models: provider.models,
+      selectedModel: provider.selectedModel,
+      source: provider.source || 'local',
+      hasApiKey: Boolean(provider.apiKey),
+      apiKeyPreview: provider.apiKey ? maskSecret(provider.apiKey) : '',
+    })),
+  }
+}
+
+function normalizeLlmProvider(input) {
+  const provider = cleanString(input?.provider) || 'openai-compatible'
+  const name = cleanString(input?.name) || provider
+  const id = cleanString(input?.id) || `${provider}-${randomUUID()}`
+  const baseUrl = cleanString(input?.baseUrl) || defaultLlmBaseUrl(provider)
+  const apiKey = cleanString(input?.apiKey)
+  const models = Array.isArray(input?.models)
+    ? input.models.map(cleanString).filter(Boolean)
+    : cleanString(input?.models).split(',').map((item) => item.trim()).filter(Boolean)
+  const selectedModel = cleanString(input?.selectedModel) || models[0] || defaultLlmModel(provider)
+  return {
+    id,
+    provider,
+    name,
+    baseUrl,
+    apiKey,
+    models: models.length ? models : [selectedModel],
+    selectedModel,
+    source: 'local',
+  }
+}
+
+function defaultLlmBaseUrl(provider) {
+  const map = {
+    openai: 'https://api.openai.com/v1',
+    'openai-compatible': 'https://api.openai.com/v1',
+    deepseek: 'https://api.deepseek.com/v1',
+    qwen: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    zhipu: 'https://open.bigmodel.cn/api/paas/v4',
+    anthropic: 'https://api.anthropic.com/v1',
+  }
+  return map[provider] || 'https://api.openai.com/v1'
+}
+
+function defaultLlmModel(provider) {
+  const map = {
+    openai: 'gpt-4o-mini',
+    'openai-compatible': 'gpt-4o-mini',
+    deepseek: 'deepseek-chat',
+    qwen: 'qwen-plus',
+    zhipu: 'glm-4-flash',
+    anthropic: 'claude-3-5-haiku-latest',
+  }
+  return map[provider] || 'gpt-4o-mini'
+}
+
+function maskSecret(value) {
+  if (!value) return ''
+  if (value.length <= 8) return '宸插～鍐?
+  return `${value.slice(0, 4)}...${value.slice(-4)}`
+}
+
 function errorMessage(error) {
   return error instanceof Error ? error.message : String(error)
 }
@@ -338,15 +546,16 @@ function createFundCode() {
 
 function normalizeFundPayload(body) {
   return {
+    id: body?.id,
     code: cleanString(body?.code),
-    name: cleanString(body?.name) || '未命名基金',
-    type: cleanString(body?.type) || '主动权益',
+    name: cleanString(body?.name) || '鏈懡鍚嶅熀閲?,
+    type: cleanString(body?.type) || '涓诲姩鏉冪泭',
     cost: toNumber(body?.cost, 1),
     nav: toNumber(body?.nav, 1),
     shares: toNumber(body?.shares, 0),
     estimateChange: toNumber(body?.estimateChange, 0),
     positionRatio: toNumber(body?.positionRatio, 0),
-    tags: cleanString(body?.tags).split(/[,\s，、]+/).map((tag) => tag.trim()).filter(Boolean).slice(0, 6),
+    tags: cleanString(body?.tags).split(/[,\s锛屻€乚+/).map((tag) => tag.trim()).filter(Boolean).slice(0, 6),
   }
 }
 
@@ -382,7 +591,7 @@ function fundNavStatement({ fundId, date = tradeDate, nav, estimatedNav = nav, c
 async function ensureSeedData() {
   await db.execute({
     sql: `INSERT OR IGNORE INTO users (id, email, display_name) VALUES (?, ?, ?)`,
-    args: [userId, 'demo@local.fund', '本地用户'],
+    args: [userId, 'demo@local.fund', '鏈湴鐢ㄦ埛'],
   })
 }
 
@@ -629,7 +838,7 @@ async function fetchEastmoneyStockQuotes(secids) {
       name: String(row.f14),
       price: Number(row.f2),
       changePercent: Number(row.f3),
-      industry: String(row.f100 || '未分类'),
+      industry: String(row.f100 || '鏈垎绫?),
       region: String(row.f102 || ''),
       concepts: String(row.f103 || '').split(',').filter(Boolean).slice(0, 6),
       updatedAt: Number(row.f124 || 0),
@@ -640,7 +849,7 @@ async function fetchEastmoneyStockQuotes(secids) {
 function summarizeSectors(stockQuotes) {
   const sectors = new Map()
   for (const stock of stockQuotes) {
-    const key = stock.industry || '未分类'
+    const key = stock.industry || '鏈垎绫?
     const current = sectors.get(key) ?? { name: key, count: 0, avgChange: 0, stocks: [] }
     current.count += 1
     current.avgChange += stock.changePercent
@@ -751,15 +960,16 @@ async function getFundEvidence(fundId) {
     stocks: [],
     concepts: [],
   }))
-  const [sectorLeaders, fastNews, announcements, breadth] = await Promise.all([
+  const [sectorLeaders, fundNews, announcements, breadth] = await Promise.all([
     fetchEastmoneySectorLeaders().catch((error) => ({ source: 'eastmoney-sector', ok: false, message: errorMessage(error), items: [] })),
-    fetchEastmoneyFastNews().catch((error) => ({ source: 'eastmoney-news', ok: false, message: errorMessage(error), items: [] })),
+    fetchEastmoneyFundNews(fund.code).catch((error) => ({ source: 'eastmoney-fund-news', ok: false, message: errorMessage(error), items: [] })),
     fetchEastmoneyFundAnnouncements(fund.code).catch((error) => ({ source: 'eastmoney-announcement', ok: false, message: errorMessage(error), items: [] })),
     fetchMarketBreadth().catch((error) => ({ source: 'eastmoney-breadth', ok: false, message: 'breadth failed', advancing: 0, declining: 0, advanceRatio: 0, breadth: 0 })),
   ])
-  const newsContext = buildNewsContext(fund, exposure, markets, fastNews.items)
-  const sentiment = await gatherMarketSentiment(markets, sectorLeaders, fastNews, breadth)
-  const agents = await buildFundAgents({ fund, markets, benchmark, analysis: { category: '', advice: null }, metricsHistory: history, exposure, sectorLeaders, fastNews, announcements, sentiment })
+  const newsContext = buildNewsContext(fund, exposure, markets, fundNews.items)
+  const sentiment = await gatherMarketSentiment(markets, sectorLeaders, fundNews, breadth)
+  const adviceAccuracy = await readFundAdviceAccuracy(fund.id)
+  const agents = await buildFundAgents({ fund, markets, benchmark, analysis: { category: '', advice: null }, metricsHistory: history, exposure, sectorLeaders, fastNews: fundNews, announcements, sentiment, adviceAccuracy })
 
   return {
     fund: {
@@ -784,22 +994,22 @@ async function getFundEvidence(fundId) {
     },
     exposure,
     sectorLeaders,
-    fastNews,
+    fastNews: fundNews,
     announcements,
     newsContext,
     agents,
     sourceStatus: [
       { source: 'eastmoney-fund', ok: exposure.ok, count: (exposure.stocks ?? []).length, message: exposure.message },
       { source: sectorLeaders.source, ok: sectorLeaders.ok, count: sectorLeaders.items.length, message: sectorLeaders.message },
-      { source: fastNews.source, ok: fastNews.ok, count: fastNews.items.length, message: fastNews.message },
+      { source: fundNews.source, ok: fundNews.ok, count: fundNews.items.length, message: fundNews.message },
       { source: announcements.source, ok: announcements.ok, count: announcements.items.length, message: announcements.message },
     ],
     evidence: [
       {
         type: 'fund_nav',
         source: latest?.source ?? 'unknown',
-        title: '基金净值',
-        value: latest ? `${latest.tradeDate} NAV ${latest.nav}` : '暂无历史净值',
+        title: '鍩洪噾鍑€鍊?,
+        value: latest ? `${latest.tradeDate} NAV ${latest.nav}` : '鏆傛棤鍘嗗彶鍑€鍊?,
       },
       {
         type: 'market',
@@ -810,7 +1020,7 @@ async function getFundEvidence(fundId) {
       {
         type: 'position',
         source: 'portfolio-db',
-        title: '当前仓位',
+        title: '褰撳墠浠撲綅',
         value: `${fund.positionRatio}%`,
       },
     ],
@@ -826,11 +1036,11 @@ function buildNewsContext(fund, exposure, markets) {
     source: 'eastmoney-news',
     keywords: [...new Set([fund.name, fund.code, ...sectorKeywords, ...stockKeywords, ...marketKeywords])],
     inputs: [
-      `基金：${fund.name}(${fund.code})`,
-      `实时估值：${formatPct(fund.estimateChange)}`,
-      sectorKeywords.length ? `主要板块：${sectorKeywords.join('、')}` : '',
-      stockKeywords.length ? `重仓股票：${stockKeywords.join('、')}` : '',
-      marketKeywords.length ? `市场参考：${marketKeywords.join('、')}` : '',
+      `鍩洪噾锛?{fund.name}(${fund.code})`,
+      `瀹炴椂浼板€硷細${formatPct(fund.estimateChange)}`,
+      sectorKeywords.length ? `涓昏鏉垮潡锛?{sectorKeywords.join('銆?)}` : '',
+      stockKeywords.length ? `閲嶄粨鑲＄エ锛?{stockKeywords.join('銆?)}` : '',
+      marketKeywords.length ? `甯傚満鍙傝€冿細${marketKeywords.join('銆?)}` : '',
     ].filter(Boolean),
   }
 }
@@ -879,7 +1089,7 @@ async function fetchMarketBreadth() {
     total,
     advanceRatio: total > 0 ? Number((advancing / total * 100).toFixed(1)) : 0,
     breadth: total > 0 ? Number(((advancing - declining) / total * 100).toFixed(1)) : 0,
-    message: `涓婃定${advancing}瀹讹紝涓嬭穼${declining}瀹讹紝涓婃定鍗犳瘮${total > 0 ? (advancing / total * 100).toFixed(1) : 0}%`,
+    message: `娑撳﹥瀹?{advancing}鐎硅绱濇稉瀣┘${declining}鐎硅绱濇稉濠冨畾閸楃姵鐦?{total > 0 ? (advancing / total * 100).toFixed(1) : 0}%`,
   }
 }
 
@@ -899,6 +1109,53 @@ async function fetchEastmoneyFastNews() {
       stocks: Array.isArray(row.stockList) ? row.stockList.map(String) : [],
     })).filter((item) => item.title),
   }
+}
+
+async function fetchEastmoneyFundNews(code) {
+  if (!/^\d{6}$/.test(code)) throw new Error('invalid fund code')
+  const url = `https://guba.eastmoney.com/list,of${code}.html`
+  const html = await fetchTextWithHeaders(url, {
+    Referer: `https://fund.eastmoney.com/${code}.html`,
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+  })
+  const items = []
+  const linkPattern = new RegExp(`<a href="([^"]*news,of${code},\\d+\\.html)"[^>]*title="([^"]+)"`, 'g')
+  for (const linkMatch of html.matchAll(linkPattern)) {
+    const blockStart = Math.max(0, linkMatch.index - 500)
+    const blockEnd = Math.min(html.length, linkMatch.index + 900)
+    const block = html.slice(blockStart, blockEnd)
+    if (!linkMatch) continue
+    const href = linkMatch[1].startsWith('http') ? linkMatch[1] : `https://guba.eastmoney.com${linkMatch[1].startsWith('/') ? '' : '/'}${linkMatch[1]}`
+    const title = cleanHtmlText(decodeHtmlEntity(linkMatch[2]))
+    if (!title || title.includes('澶╁ぉ鍩洪噾绀惧尯绠＄悊瑙勫垯') || title.includes('鑱婅亰鎴戠殑')) continue
+    const tag = cleanHtmlText(block.match(/<em class="hinfo">([\s\S]*?)<\/em>/)?.[1] ?? '')
+    const author = cleanHtmlText(block.match(/<span class="l4">[\s\S]*?<font>([\s\S]*?)<\/font>/)?.[1] ?? '')
+    const time = cleanHtmlText(block.match(/<span class="l5">([\s\S]*?)<\/span>/)?.[1] ?? '')
+    if (!isOfficialFundNews({ title, tag, author })) continue
+    items.push({
+      id: href.match(/news,[^,]+,(\d+)\.html/)?.[1] ?? href,
+      title,
+      summary: [tag, author].filter(Boolean).join(' 路 '),
+      time,
+      url: href,
+    })
+  }
+  const deduped = [...new Map(items.map((item) => [item.id, item])).values()].slice(0, 20)
+  return {
+    source: 'eastmoney-fund-news',
+    ok: deduped.length > 0,
+    message: deduped.length ? 'fund news refreshed' : 'fund news empty',
+    items: deduped,
+  }
+}
+
+function isOfficialFundNews({ title, tag, author }) {
+  const text = `${title} ${tag} ${author}`
+  const officialAuthor = /鍩洪噾璧勮|鍩洪噾鍏憡|澶╁ぉ鍩洪噾|涓滄柟璐㈠瘜|鍩洪噾鍏徃|涓婂競鍏徃鍏憡/.test(author)
+  const officialTag = /鍏憡|璧勮|鐮旀姤|鏂伴椈/.test(tag)
+  const officialTitle = /鍏憡|瀹氭湡鎶ュ憡|瀛ｅ害鎶ュ憡|骞村害鎶ュ憡|涓湡鎶ュ憡|鎷涘嫙璇存槑涔鍩洪噾浜у搧璧勬枡姒傝|鍩洪噾缁忕悊鍙樻洿|鎵樼鍗忚|鍩洪噾鍚堝悓|椋庨櫓鎻愮ず|娓呯畻鎶ュ憡/.test(title)
+  const forumNoise = /鑲″弸|鍩烘皯|鎿嶄綔鍒嗕韩|鏅掓敹鐩妡鍔犱粨|琛ヤ粨|璺戣矾|娓呬簡|璺岄夯|鍋峰悆|缁忕悊涓嶈|鍩洪噾缁忕悊涓嶇煡閬搢澶辨湜|鏄庡ぉ|浠婂ぉ鑳絴鑳戒拱鍚梶鎬庝箞鍔瀨鍨冨溇|鐑倈姝绘椿|鎺ョ洏|闊彍|鐡滃垎|涓轰粈涔坾鎬庝箞|鍜嬪洖浜媩鑰佹槸|涓嶈涔皘闄愯喘鏄粈涔堟剰鎬?.test(text)
+  return (officialAuthor || officialTag || officialTitle) && !forumNoise
 }
 
 async function fetchEastmoneyFundAnnouncements(code) {
@@ -945,14 +1202,14 @@ async function fetchTextWithHeaders(url, extraHeaders = {}) {
 
 function announcementCategory(value) {
   const map = {
-    1: '发行运作',
-    2: '分红公告',
-    3: '定期报告',
-    4: '人事调整',
-    5: '基金销售',
-    6: '其他公告',
+    1: '鍙戣杩愪綔',
+    2: '鍒嗙孩鍏憡',
+    3: '瀹氭湡鎶ュ憡',
+    4: '浜轰簨璋冩暣',
+    5: '鍩洪噾閿€鍞?,
+    6: '鍏朵粬鍏憡',
   }
-  return map[Number(value)] ?? '基金公告'
+  return map[Number(value)] ?? '鍩洪噾鍏憡'
 }
 
 function cleanHtmlText(value) {
@@ -963,13 +1220,23 @@ function cleanHtmlText(value) {
     .trim()
 }
 
+function decodeHtmlEntity(value) {
+  return String(value ?? '')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+}
+
 function matchNewsForFund(fund, exposure, fastNews = []) {
   const keywords = [
+    ...deriveFundNewsKeywords(fund),
     ...fund.tags,
     ...(exposure?.sectors ?? []).map((item) => item.name),
     ...(exposure?.stocks ?? []).map((item) => item.name),
     ...(exposure?.concepts ?? []).map((item) => item.name),
-  ].filter((item) => cleanString(item).length >= 2)
+  ].map(cleanString).filter((item) => item.length >= 2 && item !== 'OCR瀵煎叆')
   return fastNews
     .map((item) => ({
       ...item,
@@ -982,8 +1249,33 @@ function matchNewsForFund(fund, exposure, fastNews = []) {
     .sort((a, b) => b.score - a.score)
 }
 
-function buildFundAgents({ fund, markets, benchmark, analysis, metricsHistory, exposure, sectorLeaders, fastNews, announcements, sentiment }) {
-  return runFundAgents({ fund, markets, benchmark, metricsHistory, exposure, sectorLeaders, fastNews, announcements, sentiment })
+function deriveFundNewsKeywords(fund) {
+  const name = cleanString(fund?.name)
+  const keywords = []
+  const rules = [
+    [/绾虫柉杈惧厠|NASDAQ|Nasdaq/i, ['绾虫柉杈惧厠', '缇庤偂', '绉戞妧鑲?, '鑻变紵杈?, '鑻规灉', '寰蒋', '鐗规柉鎷?, 'AI']],
+    [/鏍囨櫘|S&P|SP500|500/i, ['鏍囨櫘', '鏍囨櫘500', '缇庤偂', '缇庡浗鑲″競']],
+    [/QDII/i, ['QDII', '娴峰甯傚満', '缇庤偂', '缇庡厓']],
+    [/鍏変紡/i, ['鍏変紡', '鏂拌兘婧?, '纭呮枡', '缁勪欢', '閫嗗彉鍣?]],
+    [/绋€鍦焲灏忛噾灞瀨宸ヤ笟閲戝睘/i, ['绋€鍦?, '灏忛噾灞?, '宸ヤ笟閲戝睘', '鏈夎壊閲戝睘']],
+    [/閫氫俊|閫氫俊璁惧/i, ['閫氫俊', '閫氫俊璁惧', '5G', '绠楀姏', '鍏夋ā鍧?]],
+    [/鍗婂浣搢鑺墖/i, ['鍗婂浣?, '鑺墖', '闆嗘垚鐢佃矾', 'AI鑺墖']],
+    [/娑堣垂鐢靛瓙|鍏冧欢/i, ['娑堣垂鐢靛瓙', '鐢靛瓙鍏冧欢', '鍗庝负']],
+    [/涓瘉鍏ㄦ寚/i, ['涓瘉鍏ㄦ寚']],
+  ]
+  for (const [pattern, values] of rules) {
+    if (pattern.test(name)) keywords.push(...values)
+  }
+  const shortName = name
+    .replace(/[A-Z]$/i, '')
+    .replace(/\(.*?\)|锛?*?锛?g, '')
+    .replace(/(浜烘皯甯亅鍙戣捣寮弢鑱旀帴|鎸囨暟|鑲＄エ|娣峰悎|鍩洪噾|ETF|FOF|C|A|100|500)/g, '')
+  if (shortName.length >= 2 && shortName.length <= 8) keywords.push(shortName)
+  return [...new Set(keywords)]
+}
+
+function buildFundAgents({ fund, markets, benchmark, analysis, metricsHistory, exposure, sectorLeaders, fastNews, announcements, sentiment, adviceAccuracy }) {
+  return runFundAgents({ fund, markets, benchmark, metricsHistory, exposure, sectorLeaders, fastNews, announcements, sentiment, adviceAccuracy })
 }
 
 async function gatherMarketSentiment(markets, sectorLeaders, fastNews, breadth) {
@@ -995,12 +1287,12 @@ async function gatherMarketSentiment(markets, sectorLeaders, fastNews, breadth) 
 
   return {
     indices: markets.map((m) => ({ name: m.name, change: m.change, value: m.value })),
-    breadth: breadth ?? { advancing: 0, declining: 0, advanceRatio: 0, breadth: 0, message: '未获取' },
+    breadth: breadth ?? { advancing: 0, declining: 0, advanceRatio: 0, breadth: 0, message: '鏈幏鍙? },
     sectorMomentum: {
       upCount: upSectors,
       downCount: downSectors,
       leaders: (sectorLeaders.items ?? []).slice(0, 5).map((s) => `${s.name}${formatPct(s.changePercent)}`),
-      topInflow: topInflow.map((s) => `${s.name}净流入${(s.netInflow / 1e8).toFixed(2)}亿`),
+      topInflow: topInflow.map((s) => `${s.name}鍑€娴佸叆${(s.netInflow / 1e8).toFixed(2)}浜縛),
     },
     news: newsTitles,
     overall: describeSentiment(marketMap, breadth, upSectors, downSectors),
@@ -1012,19 +1304,19 @@ function describeSentiment(marketMap, breadth, upSectors, downSectors) {
   const csi300 = marketMap.CSI300?.change ?? 0
   const ndx = marketMap.NDX?.change ?? 0
   const hstech = marketMap.HSTECH?.change ?? 0
-  if (csi300 > 0.5 && (breadth?.advanceRatio ?? 0) > 60) parts.push('A股做多情绪明显')
-  else if (csi300 < -0.5 && (breadth?.advanceRatio ?? 0) < 40) parts.push('A股承压，跌多涨少')
-  else parts.push('A股震荡')
-  if (hstech > 1) parts.push('港股科技走强')
-  else if (hstech < -1) parts.push('港股科技走弱')
-  if (ndx > 1) parts.push('美股偏强')
-  else if (ndx < -1) parts.push('美股偏弱')
-  if (upSectors > downSectors + 2) parts.push('板块普涨')
-  else if (downSectors > upSectors + 2) parts.push('板块普跌')
-  return parts.join('；')
+  if (csi300 > 0.5 && (breadth?.advanceRatio ?? 0) > 60) parts.push('A鑲″仛澶氭儏缁槑鏄?)
+  else if (csi300 < -0.5 && (breadth?.advanceRatio ?? 0) < 40) parts.push('A鑲℃壙鍘嬶紝璺屽娑ㄥ皯')
+  else parts.push('A鑲￠渿鑽?)
+  if (hstech > 1) parts.push('娓偂绉戞妧璧板己')
+  else if (hstech < -1) parts.push('娓偂绉戞妧璧板急')
+  if (ndx > 1) parts.push('缇庤偂鍋忓己')
+  else if (ndx < -1) parts.push('缇庤偂鍋忓急')
+  if (upSectors > downSectors + 2) parts.push('鏉垮潡鏅定')
+  else if (downSectors > upSectors + 2) parts.push('鏉垮潡鏅穼')
+  return parts.join('锛?)
 }
 
-function buildFundAgentContext({ fund, markets, benchmark, metricsHistory, exposure, sectorLeaders, fastNews, announcements, sentiment }) {
+function buildFundAgentContext({ fund, markets, benchmark, metricsHistory, exposure, sectorLeaders, fastNews, announcements, sentiment, adviceAccuracy }) {
   const marketMap = Object.fromEntries(markets.map((market) => [market.code, market]))
   const relative = Number((fund.estimateChange - (benchmark.change ?? 0)).toFixed(2))
   const profitRate = fund.cost > 0 ? (fund.nav - fund.cost) / fund.cost * 100 : 0
@@ -1035,6 +1327,7 @@ function buildFundAgentContext({ fund, markets, benchmark, metricsHistory, expos
   const topStocks = (exposure.stocks ?? []).slice(0, 6)
   const latestAnnouncement = announcements.items[0]
   const positionValue = Math.round(fund.nav * fund.shares)
+  const valuationPercentile = computeValuationPercentile(metricsHistory, fund.nav)
 
   return {
     fund: {
@@ -1042,90 +1335,174 @@ function buildFundAgentContext({ fund, markets, benchmark, metricsHistory, expos
       nav: fund.nav, cost: fund.cost, shares: fund.shares,
       estimateChange: fund.estimateChange, positionRatio: fund.positionRatio,
       profitRate, positionValue, relative,
+      manager: fund.manager || '', company: fund.company || '', riskLevel: fund.riskLevel || '',
     },
     benchmark: { name: benchmark.name, change: benchmark.change },
     metrics: { last30, last90 },
     exposure: { sectors: topSectors, stocks: topStocks },
-    sentiment: sentiment ?? { overall: '未获取', indices: [], breadth: {}, sectorMomentum: {}, news: [] },
+    sentiment: sentiment ?? { overall: '鏈幏鍙?, indices: [], breadth: {}, sectorMomentum: {}, news: [] },
     matchedNews: matchedNews.slice(0, 5).map((n) => n.title),
-    latestAnnouncement: latestAnnouncement ? `${latestAnnouncement.title}，${latestAnnouncement.date}` : null,
-    sectorLeaders: (sectorLeaders.items ?? []).slice(0, 5).map((s) => `${s.name}${formatPct(s.changePercent)}净流入${(s.netInflow / 1e8).toFixed(1)}亿`),
+    latestAnnouncement: latestAnnouncement ? `${latestAnnouncement.title}锛?{latestAnnouncement.date}` : null,
+    sectorLeaders: (sectorLeaders.items ?? []).slice(0, 5).map((s) => `${s.name}${formatPct(s.changePercent)}鍑€娴佸叆${(s.netInflow / 1e8).toFixed(1)}浜縛),
+    valuationPercentile,
+    adviceAccuracy: adviceAccuracy ?? { totalAdvice: 0, winCount: 0, winRate: 0, avgReturnPct: 0, recentItems: [] },
+  }
+}
+
+function computeValuationPercentile(history, currentNav) {
+  if (!history.length || !currentNav) return { p30: 50, p90: 50, p365: 50 }
+  const pct = (arr) => {
+    if (!arr.length) return 50
+    const sorted = [...arr].sort((a, b) => a - b)
+    const idx = sorted.findIndex((v) => v >= currentNav)
+    return idx < 0 ? 100 : Math.round(idx / sorted.length * 100)
+  }
+  const navs30 = history.slice(-30).map((h) => h.nav).filter(Boolean)
+  const navs90 = history.slice(-90).map((h) => h.nav).filter(Boolean)
+  const navs365 = history.map((h) => h.nav).filter(Boolean)
+  return { p30: pct(navs30), p90: pct(navs90), p365: pct(navs365) }
+}
+
+async function readFundAdviceAccuracy(fundId) {
+  try {
+    const rows = await db.execute({
+      sql: `SELECT ai.baseline_nav, ai.status, ai.created_at,
+                   n.nav AS latest_nav
+            FROM advice_items ai
+            LEFT JOIN fund_nav_snapshots n ON n.fund_id = ai.fund_id
+              AND n.id = (SELECT id FROM fund_nav_snapshots WHERE fund_id = ai.fund_id ORDER BY trade_date DESC LIMIT 1)
+            WHERE ai.fund_id = ? AND ai.status = 'executed' AND ai.baseline_nav > 0`,
+      args: [fundId],
+    })
+    const items = rows.rows.map((r) => ({
+      baselineNav: Number(r.baseline_nav),
+      latestNav: Number(r.latest_nav),
+    })).filter((r) => r.baselineNav > 0 && r.latestNav > 0)
+    const results = items.map((r) => Number(((r.latestNav - r.baselineNav) / r.baselineNav * 100).toFixed(2)))
+    const wins = results.filter((r) => r > 0)
+    return {
+      totalAdvice: items.length,
+      winCount: wins.length,
+      winRate: results.length > 0 ? Number((wins.length / results.length * 100).toFixed(1)) : 0,
+      avgReturnPct: results.length > 0 ? Number((results.reduce((s, r) => s + r, 0) / results.length).toFixed(2)) : 0,
+      recentItems: results.slice(0, 5),
+    }
+  } catch {
+    return { totalAdvice: 0, winCount: 0, winRate: 0, avgReturnPct: 0, recentItems: [] }
   }
 }
 
 async function runFundAgents(params) {
   const ctx = buildFundAgentContext(params)
-  const apiKey = process.env.LLM_API_KEY
+  const llmConfig = await getActiveLlmConfig()
 
   const agentDefs = [
-    { id: 'market', title: '市场研究员', role: '评估宏观指数、市场宽度和基准相对表现，只说明对本基金的影响路径' },
-    { id: 'sector', title: '行业研究员', role: '评估基金重仓行业、板块动量和资金流，不夸大未验证的主题叙事' },
-    { id: 'risk', title: '组合风控研究员', role: '评估仓位、回撤、波动和集中度，明确风险等级与观察阈值' },
-    { id: 'news', title: '事件研究员', role: '核对快讯和公告，只标记需要人工确认的事件风险' },
-    { id: 'trade', title: '组合决策研究员', role: '综合研究结论，输出持有、观察、减仓观察或补仓观察，不输出确定性交易指令' },
+    { id: 'market', title: '甯傚満鐮旂┒鍛?, role: '璇勪及瀹忚鎸囨暟銆佸競鍦哄搴﹀拰鍩哄噯鐩稿琛ㄧ幇锛屽彧璇存槑瀵规湰鍩洪噾鐨勫奖鍝嶈矾寰? },
+    { id: 'sector', title: '琛屼笟鐮旂┒鍛?, role: '璇勪及鍩洪噾閲嶄粨琛屼笟銆佹澘鍧楀姩閲忓拰璧勯噾娴侊紝涓嶅じ澶ф湭楠岃瘉鐨勪富棰樺彊浜? },
+    { id: 'risk', title: '缁勫悎椋庢帶鐮旂┒鍛?, role: '璇勪及浠撲綅銆佸洖鎾ゃ€佹尝鍔ㄥ拰闆嗕腑搴︼紝鏄庣‘椋庨櫓绛夌骇涓庤瀵熼槇鍊? },
+    { id: 'news', title: '浜嬩欢鐮旂┒鍛?, role: '鏍稿蹇鍜屽叕鍛婏紝鍙爣璁伴渶瑕佷汉宸ョ‘璁ょ殑浜嬩欢椋庨櫓' },
+    { id: 'trade', title: '缁勫悎鍐崇瓥鐮旂┒鍛?, role: '缁煎悎鐮旂┒缁撹锛岃緭鍑烘寔鏈夈€佽瀵熴€佸噺浠撹瀵熸垨琛ヤ粨瑙傚療锛屼笉杈撳嚭纭畾鎬т氦鏄撴寚浠? },
   ]
 
-  if (apiKey) {
-    const agents = await Promise.all(agentDefs.map((def) => runSingleAgent(def, ctx, apiKey)))
+  if (llmConfig?.apiKey) {
+    const agents = await Promise.all(agentDefs.map((def) => runSingleAgent(def, ctx, llmConfig)))
     return agents
   }
 
   return agentDefs.map((def) => fallbackAgent(def, ctx))
 }
 
-async function runSingleAgent(agentDef, ctx, apiKey) {
+async function runSingleAgent(agentDef, ctx, llmConfig) {
   const prompt = buildAgentPrompt(agentDef, ctx)
-  const baseUrl = process.env.LLM_BASE_URL || 'https://api.openai.com/v1'
-  const model = process.env.LLM_MODEL || 'gpt-4o-mini'
   try {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), 20000)
-    const response = await fetch(`${baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model,
-        messages: [{ role: 'system', content: '你是研究员级别的基金投研助手。只能基于输入数据做可追溯分析；禁止编造数据、禁止保证收益、禁止给确定性买卖指令。输出必须是严格 JSON：{"level":"positive/negative/watch/neutral","conclusion":"一句研究结论，包含动作倾向和限制条件","evidence":["可核验依据1","可核验依据2","可核验依据3"]}' }, { role: 'user', content: prompt }],
-        max_tokens: 400,
-        temperature: 0.4,
-      }),
-      signal: controller.signal,
-    })
+    const text = await requestAgentCompletion(llmConfig, prompt, controller.signal)
     clearTimeout(timer)
-    if (!response.ok) return fallbackAgent(agentDef, ctx)
-    const data = await response.json()
-    const text = String(data?.choices?.[0]?.message?.content ?? '').trim()
     const parsed = parseAgentJson(text)
-    if (parsed) return { id: agentDef.id, title: agentDef.title, level: parsed.level || 'neutral', conclusion: parsed.conclusion || text.slice(0, 200), evidence: parsed.evidence || [] }
-    return { id: agentDef.id, title: agentDef.title, level: 'neutral', conclusion: text.slice(0, 300) || '鍒嗘瀽瓒呮椂', evidence: [] }
+    if (parsed) return { id: agentDef.id, title: agentDef.title, level: parsed.level || 'neutral', conclusion: parsed.conclusion || text.slice(0, 200), evidence: parsed.evidence || [], thinking: parsed.thinking || '', recommendation: parsed.recommendation || null }
+    return { id: agentDef.id, title: agentDef.title, level: 'neutral', conclusion: text.slice(0, 300) || '鍒嗘瀽瓒呮椂', evidence: [], thinking: '', recommendation: null }
   } catch {
     return fallbackAgent(agentDef, ctx)
   }
+}
+
+async function requestAgentCompletion(llmConfig, prompt, signal) {
+  const systemPrompt = '浣犳槸鐮旂┒鍛樼骇鍒殑鍩洪噾鎶曠爺鍔╂墜銆傚彧鑳藉熀浜庤緭鍏ユ暟鎹仛鍙拷婧垎鏋愶紱绂佹缂栭€犳暟鎹€佺姝繚璇佹敹鐩娿€佺姝㈢粰纭畾鎬т拱鍗栨寚浠ゃ€俓n\n鍒嗘瀽娴佺▼瑕佹眰锛歕n1. 鍏堝湪thinking涓€愭鎺ㄧ悊锛氬垪鍑哄叧閿暟鎹偣銆佽瘑鍒紓甯搞€佽瘎浼板悇缁村害褰卞搷\n2. 鍩轰簬鎺ㄧ悊寰楀嚭缁撹鍜岃鍔ㄥ缓璁甛n\n杈撳嚭蹇呴』鏄弗鏍糐SON锛歕n{"thinking":"閫愭鎺ㄧ悊杩囩▼","level":"positive/negative/watch/neutral","conclusion":"涓€鍙ョ爺绌剁粨璁猴紝鍖呭惈鍔ㄤ綔鍊惧悜鍜岄檺鍒舵潯浠?,"evidence":["渚濇嵁1","渚濇嵁2","渚濇嵁3"],"recommendation":{"action":"鎸佹湁/瑙傚療/鍑忎粨瑙傚療/琛ヤ粨瑙傚療","targetPositionRatio":null,"stopLossNav":null,"conditions":["鏉′欢1","鏉′欢2"],"confidence":"浣?涓?楂?}}'
+  const baseUrl = llmConfig.baseUrl || defaultLlmBaseUrl(llmConfig.provider)
+  const model = llmConfig.selectedModel || defaultLlmModel(llmConfig.provider)
+
+  if (llmConfig.provider === 'anthropic') {
+    const response = await fetch(`${baseUrl.replace(/\/$/, '')}/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': llmConfig.apiKey, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model,
+        system: systemPrompt,
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 800,
+        temperature: 0.4,
+      }),
+      signal,
+    })
+    if (!response.ok) throw new Error(`LLM request failed: ${response.status}`)
+    const data = await response.json()
+    return String(data?.content?.map((part) => part.text ?? '').join('') ?? '').trim()
+  }
+
+  const response = await fetch(`${baseUrl.replace(/\/$/, '')}/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${llmConfig.apiKey}` },
+    body: JSON.stringify({
+      model,
+      messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: prompt }],
+      max_tokens: 800,
+      temperature: 0.4,
+    }),
+    signal,
+  })
+  if (!response.ok) throw new Error(`LLM request failed: ${response.status}`)
+  const data = await response.json()
+  return String(data?.choices?.[0]?.message?.content ?? '').trim()
 }
 
 function buildAgentPrompt(agentDef, ctx) {
   const f = ctx.fund
   const m = ctx.metrics
   const s = ctx.sentiment
-  const lines = [
-    `基金：${f.name}(${f.code})，类型：${f.type}，标签：${f.tags.join('、')}`,
-    `估值：今日${formatPct(f.estimateChange)}，净值${f.nav.toFixed(4)}，成本${f.cost.toFixed(4)}`,
-    `盈亏：浮盈${formatPct(f.profitRate)}，仓位${f.positionRatio}%，市值约${f.positionValue}元`,
-    `基准：${ctx.benchmark.name}${formatPct(ctx.benchmark.change)}，相对强弱${formatPct(f.relative)}`,
-    `近30日：收益${formatPct(m.last30.returnPct)}，回撤${formatPct(m.last30.maxDrawdownPct)}，波动${formatPct(m.last30.volatilityPct)}`,
-    `近90日：收益${formatPct(m.last90.returnPct)}，回撤${formatPct(m.last90.maxDrawdownPct)}，波动${formatPct(m.last90.volatilityPct)}`,
-  ]
-  if (ctx.exposure.sectors.length) lines.push(`重仓板块：${ctx.exposure.sectors.map((item) => `${item.name}权重${item.weight.toFixed(0)}%涨跌${formatPct(item.avgChange)}`).join('、')}`)
-  if (ctx.exposure.stocks.length) lines.push(`重仓股：${ctx.exposure.stocks.map((item) => `${item.name}${formatPct(item.changePercent)}`).join('、')}`)
-  if (s.overall) lines.push(`市场情绪：${s.overall}`)
-  if (s.breadth?.total) lines.push(`市场宽度：上涨${s.breadth.advancing}家，下跌${s.breadth.declining}家，上涨占比${s.breadth.advanceRatio}%`)
-  if (s.indices?.length) lines.push(`指数：${s.indices.map((item) => `${item.name}${formatPct(item.change)}`).join('、')}`)
-  if (ctx.sectorLeaders.length) lines.push(`板块资金：${ctx.sectorLeaders.join('、')}`)
-  if (ctx.matchedNews.length) lines.push(`相关快讯：${ctx.matchedNews.join('；')}`)
-  if (ctx.latestAnnouncement) lines.push(`最新公告：${ctx.latestAnnouncement}`)
-  lines.push(`研究员职责：${agentDef.role}`)
-  lines.push('输出要求：像投研备忘录，不像聊天；结论必须有条件边界；证据必须来自上面的数据。')
-  return lines.join('\n')
+  const structuredData = {
+    fund: {
+      code: f.code, name: f.name, type: f.type, tags: f.tags,
+      nav: f.nav, cost: f.cost, estimateChange: f.estimateChange,
+      positionRatio: f.positionRatio, profitRate: f.profitRate,
+      relative: f.relative, positionValue: f.positionValue,
+      manager: f.manager, company: f.company, riskLevel: f.riskLevel,
+    },
+    benchmark: ctx.benchmark,
+    metrics: {
+      last30: { returnPct: m.last30.returnPct, maxDrawdownPct: m.last30.maxDrawdownPct, volatilityPct: m.last30.volatilityPct },
+      last90: { returnPct: m.last90.returnPct, maxDrawdownPct: m.last90.maxDrawdownPct, volatilityPct: m.last90.volatilityPct },
+    },
+    exposure: ctx.exposure,
+    sentiment: { overall: s.overall, breadth: s.breadth, indices: s.indices?.map((i) => `${i.name}${formatPct(i.change)}`) },
+    valuationPercentile: ctx.valuationPercentile,
+    adviceAccuracy: ctx.adviceAccuracy,
+    sectorLeaders: ctx.sectorLeaders,
+    matchedNews: ctx.matchedNews,
+    latestAnnouncement: ctx.latestAnnouncement,
+  }
+  return `浣犳槸涓€鍚嶄笓涓氱殑${agentDef.title}锛岃亴璐ｏ細${agentDef.role}
+
+## 鍒嗘瀽鏁版嵁
+
+璇峰熀浜庝互涓婮SON鏁版嵁杩涜鍒嗘瀽锛?
+
+${JSON.stringify(structuredData)}
+
+## 杈撳嚭瑕佹眰
+
+鍍忔姇鐮斿蹇樺綍锛屼笉鍍忚亰澶╋紱缁撹蹇呴』鏈夋潯浠惰竟鐣岋紱璇佹嵁蹇呴』鏉ヨ嚜涓婇潰鐨勬暟鎹€?
+涓ユ牸杈撳嚭JSON锛歿"thinking":"閫愭鎺ㄧ悊锛?.鍏抽敭鏁版嵁瑙傚療 2.寮傚父璇嗗埆 3.褰卞搷璇勪及","level":"positive/negative/watch/neutral","conclusion":"涓€鍙ョ爺绌剁粨璁猴紝鍖呭惈鍔ㄤ綔鍊惧悜鍜岄檺鍒舵潯浠?,"evidence":["渚濇嵁1","渚濇嵁2","渚濇嵁3"],"recommendation":{"action":"鎸佹湁/瑙傚療/鍑忎粨瑙傚療/琛ヤ粨瑙傚療","targetPositionRatio":null,"stopLossNav":null,"conditions":["鏉′欢1","鏉′欢2"],"confidence":"浣?涓?楂?}}`
 }
 
 function parseAgentJson(text) {
@@ -1137,6 +1514,14 @@ function parseAgentJson(text) {
       level: ['positive', 'negative', 'watch', 'neutral'].includes(parsed.level) ? parsed.level : 'neutral',
       conclusion: String(parsed.conclusion ?? ''),
       evidence: Array.isArray(parsed.evidence) ? parsed.evidence.slice(0, 5).map(String) : [],
+      thinking: String(parsed.thinking ?? ''),
+      recommendation: parsed.recommendation ? {
+        action: String(parsed.recommendation.action ?? ''),
+        targetPositionRatio: Number.isFinite(parsed.recommendation.targetPositionRatio) ? parsed.recommendation.targetPositionRatio : null,
+        stopLossNav: Number.isFinite(parsed.recommendation.stopLossNav) ? parsed.recommendation.stopLossNav : null,
+        conditions: Array.isArray(parsed.recommendation.conditions) ? parsed.recommendation.conditions.slice(0, 5).map(String) : [],
+        confidence: ['浣?, '涓?, '楂?].includes(parsed.recommendation.confidence) ? parsed.recommendation.confidence : '浣?,
+      } : null,
     }
   } catch {
     return null
@@ -1150,48 +1535,116 @@ function fallbackAgent(agentDef, ctx) {
   const evidence = []
   let level = 'neutral'
   let conclusion = ''
+  let thinking = ''
+  let recommendation = null
 
   if (agentDef.id === 'market') {
-    evidence.push(`${ctx.benchmark.name}${formatPct(ctx.benchmark.change)}`, `相对强弱${formatPct(f.relative)}`)
+    evidence.push(`${ctx.benchmark.name}${formatPct(ctx.benchmark.change)}`, `鐩稿寮哄急${formatPct(f.relative)}`)
     if (s.overall) evidence.push(s.overall)
-    if (s.breadth?.total) evidence.push(`涨跌比${s.breadth.advancing}:${s.breadth.declining}`)
+    if (s.breadth?.total) evidence.push(`娑ㄨ穼姣?{s.breadth.advancing}:${s.breadth.declining}`)
     level = f.estimateChange >= 0 ? 'positive' : 'negative'
-    conclusion = `今日估值${formatPct(f.estimateChange)}，相对${ctx.benchmark.name}${f.relative >= 0 ? '更强' : '更弱'}${formatPct(Math.abs(f.relative))}。市场情绪：${s.overall || '数据不足'}。`
+    conclusion = `浠婃棩浼板€?{formatPct(f.estimateChange)}锛岀浉瀵?{ctx.benchmark.name}${f.relative >= 0 ? '鏇村己' : '鏇村急'}${formatPct(Math.abs(f.relative))}銆傚競鍦烘儏缁細${s.overall || '鏁版嵁涓嶈冻'}銆俙
+    thinking = `浼板€?{formatPct(f.estimateChange)}锛屽熀鍑?{ctx.benchmark.name}${formatPct(ctx.benchmark.change)}锛岀浉瀵瑰己寮?{formatPct(f.relative)}銆?{s.overall || '鎯呯华鏁版嵁涓嶈冻'}銆俙
+    recommendation = {
+      action: f.estimateChange >= 0 ? '鎸佹湁' : '瑙傚療',
+      targetPositionRatio: null,
+      stopLossNav: null,
+      conditions: [`鑻?{ctx.benchmark.name}杩炵画3鏃ヨ穼瓒?.5%锛岄檷浣庢潈鐩婁粨浣峘, '鑻ュ競鍦哄搴︿笂娑ㄥ崰姣旇繛缁?鏃ヨ秴70%锛屽彲閫傚綋鏀惧浠撲綅'],
+      confidence: '浣?,
+    }
   } else if (agentDef.id === 'sector') {
     const top = ctx.exposure.sectors[0]
     if (top) {
-      evidence.push(`${top.name}权重${top.weight.toFixed(0)}%`, `板块涨跌${formatPct(top.avgChange)}`)
+      evidence.push(`${top.name}鏉冮噸${top.weight.toFixed(0)}%`, `鏉垮潡娑ㄨ穼${formatPct(top.avgChange)}`)
       level = top.avgChange >= 0 ? 'positive' : 'negative'
-      conclusion = `主要暴露${top.name}，权重${top.weight.toFixed(0)}%，今日${formatPct(top.avgChange)}。${ctx.sectorLeaders.length ? `资金流向：${ctx.sectorLeaders.slice(0, 2).join('、')}` : ''}`
+      conclusion = `涓昏鏆撮湶${top.name}锛屾潈閲?{top.weight.toFixed(0)}%锛屼粖鏃?{formatPct(top.avgChange)}銆?{ctx.sectorLeaders.length ? `璧勯噾娴佸悜锛?{ctx.sectorLeaders.slice(0, 2).join('銆?)}` : ''}`
+      thinking = `閲嶄粨鏉垮潡${top.name}鏉冮噸${top.weight.toFixed(0)}%锛屾定璺?{formatPct(top.avgChange)}銆?{ctx.sectorLeaders.length ? `璧勯噾鏂瑰悜锛?{ctx.sectorLeaders.slice(0, 2).join('銆?)}` : ''}`
+      recommendation = {
+        action: top.avgChange >= 0 ? '鎸佹湁' : '瑙傚療',
+        targetPositionRatio: null,
+        stopLossNav: null,
+        conditions: [`鑻?{top.name}鏉垮潡鍑€娴佸叆杩炵画3鏃ヤ负璐熶笖璺屽箙瓒?%锛岄檷浣庤涓婚鏆撮湶`, '鑻ラ噸浠撴澘鍧楁崲鎵嬬巼寮傚父鏀惧ぇ锛屽叧娉ㄥ洖璋冮闄?],
+        confidence: '涓?,
+      }
     } else {
-      conclusion = '未获取到板块暴露数据。'
+      conclusion = '鏈幏鍙栧埌鏉垮潡鏆撮湶鏁版嵁銆?
+      thinking = '鏉垮潡鏆撮湶鏁版嵁缂哄け锛屾棤娉曞垽鏂涓氶闄┿€?
+      recommendation = { action: '瑙傚療', targetPositionRatio: null, stopLossNav: null, conditions: [], confidence: '浣? }
     }
   } else if (agentDef.id === 'risk') {
-    evidence.push(`浮盈${formatPct(f.profitRate)}`, `近90日回撤${formatPct(m.last90.maxDrawdownPct)}`, `波动${formatPct(m.last90.volatilityPct)}`, `仓位${f.positionRatio}%`)
+    evidence.push(`娴泩${formatPct(f.profitRate)}`, `杩?0鏃ュ洖鎾?{formatPct(m.last90.maxDrawdownPct)}`, `娉㈠姩${formatPct(m.last90.volatilityPct)}`, `浠撲綅${f.positionRatio}%`)
     level = (f.profitRate > 25 || m.last90.maxDrawdownPct < -18 || f.positionRatio > 25) ? 'watch' : 'neutral'
-    conclusion = `浮盈${formatPct(f.profitRate)}，仓位${f.positionRatio}%，近90日回撤${formatPct(m.last90.maxDrawdownPct)}，波动${formatPct(m.last90.volatilityPct)}。`
+    conclusion = `娴泩${formatPct(f.profitRate)}锛屼粨浣?{f.positionRatio}%锛岃繎90鏃ュ洖鎾?{formatPct(m.last90.maxDrawdownPct)}锛屾尝鍔?{formatPct(m.last90.volatilityPct)}銆俙
+    thinking = `娴泩${formatPct(f.profitRate)}锛屼粨浣?{f.positionRatio}%锛屽洖鎾?{formatPct(m.last90.maxDrawdownPct)}锛屾尝鍔?{formatPct(m.last90.volatilityPct)}銆?{level === 'watch' ? '瑙﹀彂椋庢帶瑙傚療淇″彿銆? : '椋庢帶鎸囨爣姝ｅ父銆?}`
+    recommendation = {
+      action: level === 'watch' ? '鍑忎粨瑙傚療' : '鎸佹湁',
+      targetPositionRatio: f.positionRatio > 25 ? 20 : null,
+      stopLossNav: f.cost > 0 ? Number((f.cost * 0.9).toFixed(4)) : null,
+      conditions: [`鑻ヤ粨浣嶈秴杩?{f.positionRatio > 25 ? 25 : 30}%锛屽缓璁垎鎵瑰噺鑷?{Math.max(10, f.positionRatio - 10)}%`, '鑻ヨ繎30鏃ュ洖鎾よ秴杩?5%锛屾殏鍋滆ˉ浠撹鍒?],
+      confidence: m.last90.maxDrawdownPct < -15 ? '涓? : '浣?,
+    }
   } else if (agentDef.id === 'news') {
     evidence.push(...ctx.matchedNews.slice(0, 3))
     if (ctx.latestAnnouncement) evidence.push(ctx.latestAnnouncement)
     level = ctx.matchedNews.length ? 'watch' : 'neutral'
-    conclusion = ctx.matchedNews.length ? `命中${ctx.matchedNews.length}条相关快讯，需要人工确认是否影响持仓。` : '快讯和公告未命中明显负面因素。'
+    conclusion = ctx.matchedNews.length ? `鍛戒腑${ctx.matchedNews.length}鏉＄浉鍏冲揩璁紝闇€瑕佷汉宸ョ‘璁ゆ槸鍚﹀奖鍝嶆寔浠撱€俙 : '蹇鍜屽叕鍛婃湭鍛戒腑鏄庢樉璐熼潰鍥犵礌銆?
+    thinking = ctx.matchedNews.length ? `鍛戒腑${ctx.matchedNews.length}鏉＄浉鍏冲揩璁紝闇€鍏虫敞浜嬩欢椋庨櫓銆俙 : '蹇鍜屽叕鍛婃棤鏄庢樉璐熼潰淇″彿銆?
+    recommendation = {
+      action: ctx.matchedNews.length ? '瑙傚療' : '鎸佹湁',
+      targetPositionRatio: null,
+      stopLossNav: null,
+      conditions: ctx.matchedNews.length ? ['鍏虫敞蹇鍚庣画鍙戝睍锛岃嫢纭閲嶅ぇ鍒╃┖鍒欒€冭檻鍑忎粨'] : [],
+      confidence: '浣?,
+    }
   } else {
-    evidence.push(`估值${formatPct(f.estimateChange)}`, `浮盈${formatPct(f.profitRate)}`, `相对强弱${formatPct(f.relative)}`)
+    evidence.push(`浼板€?{formatPct(f.estimateChange)}`, `娴泩${formatPct(f.profitRate)}`, `鐩稿寮哄急${formatPct(f.relative)}`)
     if (f.estimateChange <= -3 && f.profitRate < -8) {
       level = 'negative'
-      conclusion = '下跌且浮亏扩大，暂不情绪化补仓，等估值回稳后再按计划处理。'
+      conclusion = '涓嬭穼涓旀诞浜忔墿澶э紝鏆備笉鎯呯华鍖栬ˉ浠擄紝绛変及鍊煎洖绋冲悗鍐嶆寜璁″垝澶勭悊銆?
+      thinking = `浼板€艰穼${formatPct(f.estimateChange)}涓旀诞浜?{formatPct(f.profitRate)}锛岃Е鍙戜笅璺?娴簭淇″彿銆俙
+      recommendation = {
+        action: '琛ヤ粨瑙傚療',
+        targetPositionRatio: Math.min(f.positionRatio + 5, 30),
+        stopLossNav: f.cost > 0 ? Number((f.cost * 0.85).toFixed(4)) : null,
+        conditions: ['浠呭湪鍑€鍊间紒绋?鏃ュ悗鍐嶈ˉ浠?, `琛ヤ粨鍚庝粨浣嶄笉瓒呰繃${Math.min(f.positionRatio + 5, 30)}%`, '鍗曟琛ヤ粨涓嶈秴杩囧綋鍓嶅競鍊肩殑20%'],
+        confidence: '涓?,
+      }
     } else if (f.profitRate > 20 && f.estimateChange > 1) {
       level = 'watch'
-      conclusion = '盈利较多且当日上涨，优先设置止盈线，不建议继续追高。'
+      conclusion = '鐩堝埄杈冨涓斿綋鏃ヤ笂娑紝浼樺厛璁剧疆姝㈢泩绾匡紝涓嶅缓璁户缁拷楂樸€?
+      thinking = `娴泩${formatPct(f.profitRate)}涓斿綋鏃ユ定${formatPct(f.estimateChange)}锛岃Е鍙戞鐩堣瀵熶俊鍙枫€俙
+      recommendation = {
+        action: '鍑忎粨瑙傚療',
+        targetPositionRatio: Math.max(f.positionRatio - 5, 5),
+        stopLossNav: null,
+        conditions: [`姝㈢泩绾胯鍦ㄥ噣鍊?{Number(f.nav * 0.95).toFixed(4)}`, '鍙垎3鎵瑰噺浠擄紝姣忔壒鍑忔寔1/3', '鑻ヨ繛缁笅璺?鏃ワ紝绔嬪嵆鎵ц姝㈢泩'],
+        confidence: '涓?,
+      }
     } else if (f.relative > 1.5) {
       level = 'positive'
-      conclusion = '相对参考指数明显更强，可以继续持有观察，新增买入要看仓位上限。'
+      conclusion = '鐩稿鍙傝€冩寚鏁版槑鏄炬洿寮猴紝鍙互缁х画鎸佹湁瑙傚療锛屾柊澧炰拱鍏ヨ鐪嬩粨浣嶄笂闄愩€?
+      thinking = `鐩稿寮哄急${formatPct(f.relative)}锛岃窇璧㈠熀鍑嗘槑鏄俱€俙
+      recommendation = {
+        action: '鎸佹湁',
+        targetPositionRatio: null,
+        stopLossNav: f.cost > 0 ? Number((f.cost * 0.92).toFixed(4)) : null,
+        conditions: ['鏂板涔板叆闇€纭浠撲綅鏈秴闄?, '鑻ョ浉瀵瑰己寮辫浆璐熷垯杩涘叆瑙傚療'],
+        confidence: '浣?,
+      }
     } else {
-      conclusion = '没有触发极端信号，按原计划持有，等净值确认后复盘。'
+      conclusion = '娌℃湁瑙﹀彂鏋佺淇″彿锛屾寜鍘熻鍒掓寔鏈夛紝绛夊噣鍊肩‘璁ゅ悗澶嶇洏銆?
+      thinking = `浼板€?{formatPct(f.estimateChange)}锛屾诞鐩?{formatPct(f.profitRate)}锛岀浉瀵瑰己寮?{formatPct(f.relative)}锛屾湭瑙﹀彂鏋佺淇″彿銆俙
+      recommendation = {
+        action: '鎸佹湁',
+        targetPositionRatio: null,
+        stopLossNav: f.cost > 0 ? Number((f.cost * 0.9).toFixed(4)) : null,
+        conditions: ['鑻ュ崟鏃ヨ穼骞呰秴3%涓斾粨浣嶆湭瓒呴檺锛岃繘鍏ヨˉ浠撹瀵?, '鑻ユ诞鐩堣秴25%涓旇繛缁笂娑?鏃ワ紝杩涘叆姝㈢泩瑙傚療'],
+        confidence: '浣?,
+      }
     }
   }
 
-  return { id: agentDef.id, title: agentDef.title, level, conclusion, evidence: evidence.filter(Boolean).slice(0, 5) }
+  return { id: agentDef.id, title: agentDef.title, level, conclusion, evidence: evidence.filter(Boolean).slice(0, 5), thinking, recommendation }
 }
 async function getFundExposure(code) {
   if (!/^\d{6}$/.test(code)) throw new Error('invalid fund code')
@@ -1313,7 +1766,7 @@ async function readPortfolioExposure() {
     const sectors = parseJson(row.sectors, [])
     if (Array.isArray(sectors)) {
       for (const sector of sectors) {
-        const name = String(sector?.name ?? '未分类')
+        const name = String(sector?.name ?? '鏈垎绫?)
         const current = sectorMap.get(name) ?? { name, fundCount: 0, totalWeight: 0, weightedChange: 0 }
         current.fundCount += 1
         current.totalWeight += fundWeight
@@ -1346,7 +1799,7 @@ async function readPortfolioExposure() {
 
   const concentration = sectors
     .filter((s) => s.weight > 25)
-    .map((s) => `${s.name} 缁勫悎闆嗕腑搴?${s.weight.toFixed(0)}%锛?{s.fundCount} 鍙熀閲戯級`)
+    .map((s) => `${s.name} 缂佸嫬鎮庨梿鍡曡厬鎼?${s.weight.toFixed(0)}%閿?{s.fundCount} 閸欘亜鐔€闁叉埊绱歚)
 
   return { sectors: sectors.slice(0, 8), concentration }
 }
@@ -1457,6 +1910,7 @@ async function getDashboardData(options = {}) {
   const analysis = options.skipAnalysis ? null : buildPortfolioAnalysis(funds, markets, portfolioExposure)
   const dataSourceStatus = await getDataSourceStatus()
   const persisted = options.skipAnalysis ? null : await readLatestReportWithAdvice()
+  const fastNews = !options.skipAnalysis ? await fetchEastmoneyFastNews().catch(() => ({ items: [] })) : { items: [] }
   return {
     tradeDate,
     funds,
@@ -1467,12 +1921,13 @@ async function getDashboardData(options = {}) {
     dataSourceStatus,
     report: persisted?.report ?? null,
     adviceItems: persisted?.adviceItems ?? [],
+    fastNews: fastNews.items.slice(0, 20),
   }
 }
 
 async function readFunds() {
   const result = await db.execute({
-    sql: `SELECT f.id AS fund_id, f.code, f.name, f.fund_type, f.tags, h.avg_cost, h.shares, h.target_position_ratio,
+    sql: `SELECT f.id AS fund_id, f.code, f.name, f.fund_type, f.tags, f.manager, f.company, f.risk_level, h.avg_cost, h.shares, h.target_position_ratio,
                  COALESCE(n.estimated_nav, n.nav, h.avg_cost) AS nav,
                  COALESCE(n.change_percent, 0) AS estimate_change,
                  n.source AS nav_source,
@@ -1504,6 +1959,9 @@ async function readFunds() {
     estimateChange: Number(row.estimate_change),
     positionRatio: Number(row.target_position_ratio),
     tags: parseJsonArray(row.tags),
+    manager: String(row.manager ?? ''),
+    company: String(row.company ?? ''),
+    riskLevel: String(row.risk_level ?? ''),
     estimateSource: String(row.nav_source ?? ''),
     estimateDate: String(row.estimate_date ?? ''),
     estimateUpdatedAt: String(row.estimate_updated_at ?? ''),
@@ -1581,6 +2039,7 @@ async function readLatestReportWithAdvice() {
   if (!reportRow) return null
   const adviceResult = await db.execute({
     sql: `SELECT a.id, a.fund_id, a.title, a.level, a.reason, a.action, a.status, a.created_at,
+                 a.thinking, a.target_position, a.stop_loss_nav, a.action_conditions, a.confidence,
                  f.code AS fund_code, f.name AS fund_name
           FROM advice_items a
           LEFT JOIN funds f ON f.id = a.fund_id
@@ -1608,6 +2067,11 @@ async function readLatestReportWithAdvice() {
       reason: String(row.reason),
       action: String(row.action),
       status: String(row.status ?? 'open'),
+      thinking: String(row.thinking ?? ''),
+      targetPosition: Number(row.target_position) || null,
+      stopLossNav: Number(row.stop_loss_nav) || null,
+      actionConditions: parseJson(row.action_conditions, []),
+      confidence: String(row.confidence ?? '浣?),
     })),
   }
 }
@@ -1623,11 +2087,11 @@ async function persistAnalysisReport() {
   ])
   const sentiment = await gatherMarketSentiment(markets, sectorLeaders, fastNews, breadth)
   const analysis = buildPortfolioAnalysis(funds, markets, portfolioExposure)
-  const riskProfile = analysis.riskItems.length ? '鍋忛珮椋庨櫓' : '姝ｅ父'
+  const riskProfile = analysis.riskItems.length ? '閸嬪繘鐝搴ㄦ珦' : '濮濓絽鐖?
   const marketView = sentiment.overall || ''
 
   const llmSummary = await generateLlmSummary(buildLlmPrompt(analysis, markets, sentiment))
-  const summary = llmSummary ? `${analysis.summary}\n\nAI 瑙ｈ锛?{llmSummary}` : analysis.summary
+  const summary = llmSummary ? `${analysis.summary}\n\nAI 鐟欙綀顕伴敍?{llmSummary}` : analysis.summary
 
   await db.execute({
     sql: `INSERT INTO analysis_reports (id, user_id, trade_date, risk_profile, summary, market_view, portfolio_view)
@@ -1638,7 +2102,7 @@ async function persistAnalysisReport() {
                         market_view = excluded.market_view,
                         portfolio_view = excluded.portfolio_view,
                         updated_at = datetime('now')`,
-    args: [randomUUID(), userId, tradeDate, riskProfile, summary, marketView, analysis.agents.map((a) => `${a.role}锛?{a.view}`).join('\n')],
+    args: [randomUUID(), userId, tradeDate, riskProfile, summary, marketView, analysis.agents.map((a) => `${a.role}閿?{a.view}`).join('\n')],
   })
 
   const reportRow = await db.execute({
@@ -1668,13 +2132,18 @@ async function persistAnalysisReport() {
     })
     const tradeAgent = agents.find((a) => a.id === 'trade') ?? agents[agents.length - 1]
     adviceStatements.push({
-      sql: `INSERT INTO advice_items (id, report_id, fund_id, title, level, reason, action, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      sql: `INSERT INTO advice_items (id, report_id, fund_id, title, level, reason, action, status, thinking, target_position, stop_loss_nav, action_conditions, confidence)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       args: [
         randomUUID(), reportId, fund.id || null,
         tradeAgent.title, tradeAgent.level,
         agents.filter((a) => a.id !== 'trade').map((a) => `${a.title}锛?{a.conclusion}`).join(' '),
         tradeAgent.conclusion, 'open',
+        tradeAgent.thinking || agents.map((a) => a.thinking).filter(Boolean).join('\n'),
+        tradeAgent.recommendation?.targetPositionRatio ?? null,
+        tradeAgent.recommendation?.stopLossNav ?? null,
+        JSON.stringify(tradeAgent.recommendation?.conditions ?? []),
+        tradeAgent.recommendation?.confidence ?? '浣?,
       ],
     })
   }
@@ -1684,13 +2153,82 @@ async function persistAnalysisReport() {
 }
 
 function buildLlmPrompt(analysis, markets, sentiment) {
-  const marketLine = markets.map((m) => `${m.name}${formatPct(m.change)}`).join('、')
-  const riskLine = analysis.riskItems.length ? analysis.riskItems.join('；') : '无明显风险'
-  const sectorLine = (analysis.portfolioExposure?.sectors ?? []).slice(0, 5).map((s) => `${s.name}权重${s.weight.toFixed(0)}%`).join('、')
-  const sentimentLine = sentiment?.overall || '未获取'
-  const breadthLine = sentiment?.breadth?.total ? `上涨${sentiment.breadth.advancing}家，下跌${sentiment.breadth.declining}家` : ''
-  const fundLine = analysis.fundAnalyses.slice(0, 8).map((f) => `${f.name}(${f.category}, 相对${formatPct(f.relative)})`).join('、')
-  return `你是基金持仓分析助手，请基于以下数据用2-3句话给出组合层面的风险提示和操作纪律建议，不要给具体买卖指令。\n市场：${marketLine}\n市场情绪：${sentimentLine}${breadthLine ? `；${breadthLine}` : ''}\n风险：${riskLine}\n组合暴露：${sectorLine || '暂无'}\n基金表现：${fundLine}`
+  const marketLine = markets.map((m) => `${m.name}${formatPct(m.change)}`).join('銆?)
+  const riskLine = analysis.riskItems.length ? analysis.riskItems.join('锛?) : '鏃犳槑鏄鹃闄?
+  const sectorLine = (analysis.portfolioExposure?.sectors ?? []).slice(0, 5).map((s) => `${s.name}鏉冮噸${s.weight.toFixed(0)}%`).join('銆?)
+  const sentimentLine = sentiment?.overall || '鏈幏鍙?
+  const breadthLine = sentiment?.breadth?.total ? `涓婃定${sentiment.breadth.advancing}瀹讹紝涓嬭穼${sentiment.breadth.declining}瀹禶 : ''
+  const fundLine = analysis.fundAnalyses.slice(0, 8).map((f) => `${f.name}(${f.category}, 鐩稿${formatPct(f.relative)})`).join('銆?)
+  return `浣犳槸鍩洪噾鎸佷粨鍒嗘瀽鍔╂墜锛岃鍩轰簬浠ヤ笅鏁版嵁鐢?-3鍙ヨ瘽缁欏嚭缁勫悎灞傞潰鐨勯闄╂彁绀哄拰鎿嶄綔绾緥寤鸿锛屼笉瑕佺粰鍏蜂綋涔板崠鎸囦护銆俓n甯傚満锛?{marketLine}\n甯傚満鎯呯华锛?{sentimentLine}${breadthLine ? `锛?{breadthLine}` : ''}\n椋庨櫓锛?{riskLine}\n缁勫悎鏆撮湶锛?{sectorLine || '鏆傛棤'}\n鍩洪噾琛ㄧ幇锛?{fundLine}`
+}
+
+async function getFundAnalysisHistory(fundId) {
+  try {
+    const rows = await db.execute({
+      sql: `SELECT ai.id, ai.title, ai.level, ai.reason, ai.action, ai.status,
+                   ai.thinking, ai.target_position, ai.stop_loss_nav,
+                   ai.action_conditions, ai.confidence,
+                   ai.baseline_nav, ai.executed_at, ai.created_at,
+                   ar.trade_date, ar.market_view
+            FROM advice_items ai
+            JOIN analysis_reports ar ON ar.id = ai.report_id
+            WHERE ai.fund_id = ?
+            ORDER BY ar.trade_date DESC, ai.created_at DESC
+            LIMIT 30`,
+      args: [fundId],
+    })
+    let latestNav = 0
+    try {
+      const navRow = await db.execute({
+        sql: `SELECT COALESCE(estimated_nav, nav, 0) AS nav FROM fund_nav_snapshots WHERE fund_id = ? ORDER BY trade_date DESC LIMIT 1`,
+        args: [fundId],
+      })
+      latestNav = Number(navRow.rows[0]?.nav ?? 0)
+    } catch { /* ignore */ }
+
+    const items = rows.rows.map((row) => {
+      const baseline = Number(row.baseline_nav) || 0
+      let actualReturnPct = null
+      if (baseline > 0 && latestNav > 0 && row.status === 'executed') {
+        actualReturnPct = Number(((latestNav - baseline) / baseline * 100).toFixed(2))
+      }
+      return {
+        id: String(row.id),
+        tradeDate: String(row.trade_date ?? ''),
+        level: String(row.level),
+        action: String(row.action),
+        conclusion: String(row.action),
+        thinking: String(row.thinking ?? ''),
+        recommendation: {
+          targetPosition: Number(row.target_position) || null,
+          stopLossNav: Number(row.stop_loss_nav) || null,
+          conditions: parseJson(row.action_conditions, []),
+          confidence: String(row.confidence ?? '浣?),
+        },
+        status: String(row.status ?? 'open'),
+        baselineNav: baseline || null,
+        actualReturnPct,
+        executedAt: String(row.executed_at ?? '').slice(0, 10),
+        createdAt: String(row.created_at ?? ''),
+      }
+    })
+
+    const executed = items.filter((i) => i.status === 'executed' && i.actualReturnPct != null)
+    const wins = executed.filter((i) => i.actualReturnPct > 0)
+    return {
+      fundId,
+      totalReports: items.length,
+      accuracy: {
+        totalExecuted: executed.length,
+        winCount: wins.length,
+        winRate: executed.length > 0 ? Number((wins.length / executed.length * 100).toFixed(1)) : 0,
+        avgReturnPct: executed.length > 0 ? Number((executed.reduce((s, i) => s + i.actualReturnPct, 0) / executed.length).toFixed(2)) : 0,
+      },
+      history: items,
+    }
+  } catch {
+    return { fundId, totalReports: 0, accuracy: { totalExecuted: 0, winCount: 0, winRate: 0, avgReturnPct: 0 }, history: [] }
+  }
 }
 
 async function getAdviceStats() {
@@ -1811,32 +2349,32 @@ function buildPortfolioAnalysis(funds, markets, portfolioExposure) {
   const marketMap = Object.fromEntries(markets.map((market) => [market.code, market.change]))
   const fundAnalyses = funds.map((fund) => analyzeFund(fund, marketMap))
   const totalValue = funds.reduce((sum, fund) => sum + fund.nav * fund.shares, 0)
-  const equityPosition = funds.filter((fund) => !['债券', '货币'].includes(fund.type)).reduce((sum, fund) => sum + fund.positionRatio, 0)
+  const equityPosition = funds.filter((fund) => !['鍊哄埜', '璐у竵'].includes(fund.type)).reduce((sum, fund) => sum + fund.positionRatio, 0)
   const duplicateTags = getDuplicateTags(funds)
   const concentration = portfolioExposure?.concentration ?? []
   const riskItems = [
-    equityPosition > 70 ? `权益仓位 ${equityPosition}% 偏高` : '',
-    duplicateTags.length ? `主题重复：${duplicateTags.join('、')}` : '',
+    equityPosition > 70 ? `鏉冪泭浠撲綅 ${equityPosition}% 鍋忛珮` : '',
+    duplicateTags.length ? `涓婚閲嶅锛?{duplicateTags.join('銆?)}` : '',
     ...concentration,
   ].filter(Boolean)
-  const sectorView = (portfolioExposure?.sectors ?? []).slice(0, 3).map((s) => `${s.name} ${s.weight.toFixed(0)}%`).join('、')
+  const sectorView = (portfolioExposure?.sectors ?? []).slice(0, 3).map((s) => `${s.name} ${s.weight.toFixed(0)}%`).join('銆?)
   return {
-    summary: `当前持仓 ${funds.length} 只，估算市值 ${Math.round(totalValue)} 元，权益仓位 ${equityPosition}%。`,
+    summary: `褰撳墠鎸佷粨 ${funds.length} 鍙紝浼扮畻甯傚€?${Math.round(totalValue)} 鍏冿紝鏉冪泭浠撲綅 ${equityPosition}%銆俙,
     riskItems,
     portfolioExposure: portfolioExposure ?? { sectors: [], concentration: [] },
     fundAnalyses,
     agents: [
-      { role: '行情分析员', view: `沪深300 ${formatPct(marketMap.CSI300)}，创业板 ${formatPct(marketMap.CHINEXT)}，市场环境偏${(marketMap.CSI300 ?? 0) >= 0 ? '积极' : '谨慎'}。` },
-      { role: '基金分析员', view: `重点关注跑输参考市场的基金：${fundAnalyses.filter((item) => item.category === '跑输市场').map((item) => item.name).join('、') || '暂无'}。` },
-      { role: '风控分析员', view: riskItems.length ? riskItems.join('；') : '当前未触发明显集中度或仓位风险。' },
-      { role: '持仓穿透员', view: sectorView ? `组合主要暴露：${sectorView}。` : '暂无持仓穿透数据，建议刷新行情后查看。' },
-      { role: '建议分析员', view: '建议以持有和观察为主，只在仓位未超限且跌幅达到计划区间时再补仓。' },
-      { role: '复盘分析员', view: '每天保存建议、实际操作和原因，后续用于识别追涨、过早补仓等行为偏差。' },
+      { role: '琛屾儏鍒嗘瀽鍛?, view: `娌繁300 ${formatPct(marketMap.CSI300)}锛屽垱涓氭澘 ${formatPct(marketMap.CHINEXT)}锛屽競鍦虹幆澧冨亸${(marketMap.CSI300 ?? 0) >= 0 ? '绉瀬' : '璋ㄦ厧'}銆俙 },
+      { role: '鍩洪噾鍒嗘瀽鍛?, view: `閲嶇偣鍏虫敞璺戣緭鍙傝€冨競鍦虹殑鍩洪噾锛?{fundAnalyses.filter((item) => item.category === '璺戣緭甯傚満').map((item) => item.name).join('銆?) || '鏆傛棤'}銆俙 },
+      { role: '椋庢帶鍒嗘瀽鍛?, view: riskItems.length ? riskItems.join('锛?) : '褰撳墠鏈Е鍙戞槑鏄鹃泦涓害鎴栦粨浣嶉闄┿€? },
+      { role: '鎸佷粨绌块€忓憳', view: sectorView ? `缁勫悎涓昏鏆撮湶锛?{sectorView}銆俙 : '鏆傛棤鎸佷粨绌块€忔暟鎹紝寤鸿鍒锋柊琛屾儏鍚庢煡鐪嬨€? },
+      { role: '寤鸿鍒嗘瀽鍛?, view: '寤鸿浠ユ寔鏈夊拰瑙傚療涓轰富锛屽彧鍦ㄤ粨浣嶆湭瓒呴檺涓旇穼骞呰揪鍒拌鍒掑尯闂存椂鍐嶈ˉ浠撱€? },
+      { role: '澶嶇洏鍒嗘瀽鍛?, view: '姣忓ぉ淇濆瓨寤鸿銆佸疄闄呮搷浣滃拰鍘熷洜锛屽悗缁敤浜庤瘑鍒拷娑ㄣ€佽繃鏃╄ˉ浠撶瓑琛屼负鍋忓樊銆? },
     ],
     scenarios: [
-      { name: '上涨情景', impact: '权益基金受益，但重复主题需要考虑分批止盈。' },
-      { name: '震荡情景', impact: '优先维持仓位纪律，避免因单日波动频繁操作。' },
-      { name: '回撤情景', impact: '只有低于计划阈值且仓位未超限的基金进入补仓观察。' },
+      { name: '涓婃定鎯呮櫙', impact: '鏉冪泭鍩洪噾鍙楃泭锛屼絾閲嶅涓婚闇€瑕佽€冭檻鍒嗘壒姝㈢泩銆? },
+      { name: '闇囪崱鎯呮櫙', impact: '浼樺厛缁存寔浠撲綅绾緥锛岄伩鍏嶅洜鍗曟棩娉㈠姩棰戠箒鎿嶄綔銆? },
+      { name: '鍥炴挙鎯呮櫙', impact: '鍙湁浣庝簬璁″垝闃堝€间笖浠撲綅鏈秴闄愮殑鍩洪噾杩涘叆琛ヤ粨瑙傚療銆? },
     ],
   }
 }
@@ -1844,7 +2382,7 @@ function buildPortfolioAnalysis(funds, markets, portfolioExposure) {
 function analyzeFund(fund, marketMap) {
   const benchmark = chooseBenchmark(fund, marketMap)
   const relative = Number((fund.estimateChange - benchmark.change).toFixed(2))
-  const category = relative > 0.8 ? '跑赢市场' : relative < -0.8 ? '跑输市场' : Math.abs(fund.estimateChange) > 2.5 ? '异常波动' : '跟随市场'
+  const category = relative > 0.8 ? '璺戣耽甯傚満' : relative < -0.8 ? '璺戣緭甯傚満' : Math.abs(fund.estimateChange) > 2.5 ? '寮傚父娉㈠姩' : '璺熼殢甯傚満'
   return {
     fundId: fund.id,
     name: fund.name,
@@ -1854,26 +2392,26 @@ function analyzeFund(fund, marketMap) {
     category,
     reasons: buildReasons(fund, benchmark, relative),
     advice: null,
-    confidence: Math.abs(relative) > 1.2 ? '中' : '低',
+    confidence: Math.abs(relative) > 1.2 ? '涓? : '浣?,
   }
 }
 
 function chooseBenchmark(fund, marketMap) {
   const name = `${fund.name}${fund.tags.join('')}`
-  if (fund.type === '债券' || name.includes('债')) return { code: 'CN10Y', name: '十年国债', change: marketMap.CN10Y ?? 0 }
-  if (name.includes('纳斯达克') || name.includes('纳指') || name.includes('NDX')) return { code: 'NDX', name: '纳斯达克100', change: marketMap.NDX ?? 0 }
-  if (name.includes('标普') || name.includes('SPX') || name.includes('S&P')) return { code: 'SPX', name: '标普500', change: marketMap.SPX ?? 0 }
-  if (name.includes('恒生') || name.includes('港股') || name.includes('恒生科技')) return { code: 'HSI', name: '恒生指数', change: marketMap.HSI ?? 0 }
-  if (fund.type === 'QDII' || fund.tags.includes('港美')) return { code: 'NDX', name: '纳斯达克100', change: marketMap.NDX ?? 0 }
-  if (name.includes('通信') || name.includes('电子') || name.includes('半导体') || name.includes('芯片')) return { code: 'CHINEXT', name: '创业板指', change: marketMap.CHINEXT ?? 0 }
-  return { code: 'CSI300', name: '沪深300', change: marketMap.CSI300 ?? 0 }
+  if (fund.type === '鍊哄埜' || name.includes('鍊?)) return { code: 'CN10Y', name: '鍗佸勾鍥藉€?, change: marketMap.CN10Y ?? 0 }
+  if (name.includes('绾虫柉杈惧厠') || name.includes('绾虫寚') || name.includes('NDX')) return { code: 'NDX', name: '绾虫柉杈惧厠100', change: marketMap.NDX ?? 0 }
+  if (name.includes('鏍囨櫘') || name.includes('SPX') || name.includes('S&P')) return { code: 'SPX', name: '鏍囨櫘500', change: marketMap.SPX ?? 0 }
+  if (name.includes('鎭掔敓') || name.includes('娓偂') || name.includes('鎭掔敓绉戞妧')) return { code: 'HSI', name: '鎭掔敓鎸囨暟', change: marketMap.HSI ?? 0 }
+  if (fund.type === 'QDII' || fund.tags.includes('娓編')) return { code: 'NDX', name: '绾虫柉杈惧厠100', change: marketMap.NDX ?? 0 }
+  if (name.includes('閫氫俊') || name.includes('鐢靛瓙') || name.includes('鍗婂浣?) || name.includes('鑺墖')) return { code: 'CHINEXT', name: '鍒涗笟鏉挎寚', change: marketMap.CHINEXT ?? 0 }
+  return { code: 'CSI300', name: '娌繁300', change: marketMap.CSI300 ?? 0 }
 }
 function buildReasons(fund, benchmark, relative) {
-  const reasons = [`今日估值${formatPct(fund.estimateChange)}，参考${benchmark.name}${formatPct(benchmark.change)}。`]
-  if (relative > 0.8) reasons.push(`相对参考指数强 ${formatPct(relative)}，短线表现较强。`)
-  if (relative < -0.8) reasons.push(`相对参考指数弱 ${formatPct(Math.abs(relative))}，需要观察是否为基金自身因素。`)
+  const reasons = [`浠婃棩浼板€?{formatPct(fund.estimateChange)}锛屽弬鑰?{benchmark.name}${formatPct(benchmark.change)}銆俙]
+  if (relative > 0.8) reasons.push(`鐩稿鍙傝€冩寚鏁板己 ${formatPct(relative)}锛岀煭绾胯〃鐜拌緝寮恒€俙)
+  if (relative < -0.8) reasons.push(`鐩稿鍙傝€冩寚鏁板急 ${formatPct(Math.abs(relative))}锛岄渶瑕佽瀵熸槸鍚︿负鍩洪噾鑷韩鍥犵礌銆俙)
   const profitRate = fund.cost > 0 ? (fund.nav - fund.cost) / fund.cost * 100 : 0
-  reasons.push(`当前浮盈${formatPct(profitRate)}，成本${fund.cost.toFixed(4)}，估值${fund.nav.toFixed(4)}。`)
+  reasons.push(`褰撳墠娴泩${formatPct(profitRate)}锛屾垚鏈?{fund.cost.toFixed(4)}锛屼及鍊?{fund.nav.toFixed(4)}銆俙)
   return reasons
 }
 function getDuplicateTags(funds) {
@@ -1904,7 +2442,7 @@ async function recognizePositionScreenshot(imageBuffer) {
     body,
   })
   const data = await response.json()
-  if (!response.ok || data.error_code) throw new Error(`鐧惧害 OCR 澶辫触锛?{data.error_msg ?? response.statusText}`)
+  if (!response.ok || data.error_code) throw new Error(`閻ф儳瀹?OCR 婢惰精瑙﹂敍?{data.error_msg ?? response.statusText}`)
 
   const lines = Array.isArray(data.words_result) ? data.words_result.map((item) => String(item.words ?? '').trim()).filter(Boolean) : []
   return {
@@ -1932,7 +2470,7 @@ async function getBaiduAccessToken() {
     body,
   })
   const data = await response.json()
-  if (!response.ok || !data.access_token) throw new Error(`鐧惧害 OCR token 鑾峰彇澶辫触锛?{data.error_description ?? response.statusText}`)
+  if (!response.ok || !data.access_token) throw new Error(`閻ф儳瀹?OCR token 閼惧嘲褰囨径杈Е閿?{data.error_description ?? response.statusText}`)
 
   baiduAccessToken = data.access_token
   baiduAccessTokenExpiresAt = now + Math.max(1, Number(data.expires_in ?? 3600) - 300) * 1000
@@ -1964,10 +2502,10 @@ async function extractHoldingRows(lines) {
   const rows = []
   for (let index = 0; index < lines.length - 1; index += 1) {
     const name = cleanString(lines[index])
-    if (!isLikelyFundName(name) || lines[index + 1] !== '鍩洪噾') continue
+    if (!isLikelyFundName(name) || lines[index + 1] !== '閸╂椽鍣?) continue
     const window = lines.slice(index + 2, index + 10)
     const amounts = window.filter((line) => /^[+-]?\d{1,3}(?:,\d{3})*(?:\.\d+)?$/.test(line))
-    const positionRatio = window.find((line) => /^鍗犳瘮\d+(?:\.\d+)?%$/.test(line))
+    const positionRatio = window.find((line) => /^閸楃姵鐦甛d+(?:\.\d+)?%$/.test(line))
     rows.push({
       recognizedName: name,
       amount: amounts[0] ? Number(amounts[0].replace(/,/g, '')) : 0,
@@ -1983,8 +2521,8 @@ async function extractHoldingRows(lines) {
 
 function isLikelyFundName(value) {
   if (value.length < 5 || value.length > 42) return false
-  if (['鍏ㄩ儴鎸佹湁', '鏀剁泭鍒嗘瀽', '閰嶇疆鍒嗘瀽', '浜ゆ槗鍒嗘瀽', '鍚嶇О/閲戦', '鎸佹湁鏀剁泭鎺掑簭'].includes(value)) return false
-  return /(娣峰悎|鎸囨暟|ETF|鑱旀帴|QDII|FOF|鑲＄エ|鍊哄埜|璐у竵|浠峰€紎涓瘉|绾虫柉杈惧厠|鏍囨櫘)/i.test(value)
+  if (['閸忋劑鍎撮幐浣规箒', '閺€鍓佹抄閸掑棙鐎?, '闁板秶鐤嗛崚鍡樼€?, '娴溿倖妲楅崚鍡樼€?, '閸氬秶袨/闁叉垿顤?, '閹镐焦婀侀弨鍓佹抄閹烘帒绨?].includes(value)) return false
+  return /(濞ｅ嘲鎮巪閹稿洦鏆焲ETF|閼辨梹甯磡QDII|FOF|閼诧紕銈▅閸婂搫鍩渱鐠愌冪|娴犲嘲鈧磶娑擃叀鐦墊缁捐櫕鏌夋潏鎯у帬|閺嶅洦娅?/i.test(value)
 }
 
 let fundDirectoryCache = null
@@ -2017,7 +2555,7 @@ function normalizeSearchText(value) {
   return String(value ?? '')
     .toUpperCase()
     .replace(/\s+/g, '')
-    .replace(/[()（）·\\-_\\[\\]【】]/g, '')
+    .replace(/[()锛堬級路\\-_\\[\\]銆愩€慮/g, '')
 }
 
 function scoreFundName(target, candidate) {
@@ -2025,8 +2563,8 @@ function scoreFundName(target, candidate) {
   if (target === candidate) return 120
   if (candidate.includes(target)) return 100
   if (target.includes(candidate)) return 90
-  const compactTarget = target.replace(/鍩洪噾|璇佸埜鎶曡祫鍩洪噾/g, '')
-  const compactCandidate = candidate.replace(/鍩洪噾|璇佸埜鎶曡祫鍩洪噾/g, '')
+  const compactTarget = target.replace(/閸╂椽鍣緗鐠囦礁鍩滈幎鏇＄カ閸╂椽鍣?g, '')
+  const compactCandidate = candidate.replace(/閸╂椽鍣緗鐠囦礁鍩滈幎鏇＄カ閸╂椽鍣?g, '')
   if (compactTarget === compactCandidate) return 88
   if (compactCandidate.includes(compactTarget)) return 80
   if (compactTarget.includes(compactCandidate)) return 70
@@ -2060,8 +2598,8 @@ async function resolveOcrImportHolding(holding) {
   const cost = shares > 0 && costBasis > 0 ? Number((costBasis / shares).toFixed(4)) : Number((fundData?.latest?.nav ?? estimate?.unitNav ?? 1).toFixed(4))
   return {
     code: holding.code,
-    name: fundData?.name || estimate?.name || directoryMatch?.name || `OCR瀵煎叆鍩洪噾${holding.code}`,
-    type: directoryMatch?.type || 'OCR瀵煎叆',
+    name: fundData?.name || estimate?.name || directoryMatch?.name || `OCR鐎电厧鍙嗛崺娲櫨${holding.code}`,
+    type: directoryMatch?.type || 'OCR鐎电厧鍙?,
     shares,
     cost,
     positionRatio: Number(holding.positionRatio || 0),
@@ -2075,11 +2613,11 @@ async function extractHoldingRowsV2(lines) {
     const name = cleanLines[index]
     if (!isLikelyFundNameV2(name)) continue
     const window = cleanLines.slice(index + 1, index + 14)
-    if (!window.slice(0, 2).some((line) => line === '鍩洪噾')) continue
+    if (!window.slice(0, 2).some((line) => line === '閸╂椽鍣?)) continue
     const amounts = window
       .map(parseOcrAmount)
       .filter((value) => value != null)
-    const positionLine = window.find((line) => /鍗犳瘮\s*\d+(?:\.\d+)?%/.test(line))
+    const positionLine = window.find((line) => /閸楃姵鐦甛s*\d+(?:\.\d+)?%/.test(line))
     const matchedFunds = await searchFundsByName(name).catch(() => [])
     rows.push({
       recognizedName: name,
@@ -2098,7 +2636,7 @@ function isLikelyFundNameV2(value) {
   const text = cleanString(value)
   if (text.length < 5 || text.length > 42) return false
   if (/^[+-]?\d{1,3}(?:,\d{3})*(?:\.\d+)?$|^[+-]?\d+(?:\.\d+)?%$/.test(text)) return false
-  if (/[<>%]/.test(text) || /(收益|分析|全部|名称|金额|排序|占比|基金$|理财|定投|算力|心脏|光模块)/.test(text)) return false
+  if (/[<>%]/.test(text) || /(鏀剁泭|鍒嗘瀽|鍏ㄩ儴|鍚嶇О|閲戦|鎺掑簭|鍗犳瘮|鍩洪噾$|鐞嗚储|瀹氭姇|绠楀姏|蹇冭剰|鍏夋ā鍧?/.test(text)) return false
   return /[A-Za-z\u4e00-\u9fa5]/.test(text)
 }
 
@@ -2106,8 +2644,8 @@ function normalizeSearchTextV2(value) {
   return cleanString(value)
     .toUpperCase()
     .replace(/\s+/g, '')
-    .replace(/[()（）·\\-_\\[\\]【】]/g, '')
-    .replace(/鍩洪噾$/g, '')
+    .replace(/[()锛堬級路\\-_\\[\\]銆愩€慮/g, '')
+    .replace(/閸╂椽鍣?/g, '')
 }
 
 function scoreFundNameV2(target, candidate) {
@@ -2115,8 +2653,8 @@ function scoreFundNameV2(target, candidate) {
   if (target === candidate) return 120
   if (candidate.includes(target)) return 105
   if (target.includes(candidate)) return 95
-  const compactTarget = target.replace(/璇佸埜鎶曡祫鍩洪噾|鎸囨暟鍨嬪彂璧峰紡|鍙戣捣寮弢鍩洪噾/g, '')
-  const compactCandidate = candidate.replace(/璇佸埜鎶曡祫鍩洪噾|鎸囨暟鍨嬪彂璧峰紡|鍙戣捣寮弢鍩洪噾/g, '')
+  const compactTarget = target.replace(/鐠囦礁鍩滈幎鏇＄カ閸╂椽鍣緗閹稿洦鏆熼崹瀣絺鐠у嘲绱閸欐垼鎹ｅ寮㈤崺娲櫨/g, '')
+  const compactCandidate = candidate.replace(/鐠囦礁鍩滈幎鏇＄カ閸╂椽鍣緗閹稿洦鏆熼崹瀣絺鐠у嘲绱閸欐垼鎹ｅ寮㈤崺娲櫨/g, '')
   if (compactTarget === compactCandidate) return 92
   if (compactCandidate.includes(compactTarget)) return 84
   if (compactTarget.includes(compactCandidate)) return 76
@@ -2139,8 +2677,8 @@ function normalizeSearchTextV3(value) {
   return cleanString(value)
     .toUpperCase()
     .replace(/\s+/g, '')
-    .replace(/[()（）·\\-_\\[\\]【】]/g, '')
-    .replace(/璇佸埜鎶曡祫鍩洪噾|鎸囨暟鍨嬪彂璧峰紡|鍙戣捣寮弢鍩洪噾|浜烘皯甯亅缇庡厓鐜版眹|缇庡厓鐜伴挒|鑱旀帴鍩洪噾/g, '')
+    .replace(/[()锛堬級路\\-_\\[\\]銆愩€慮/g, '')
+    .replace(/鐠囦礁鍩滈幎鏇＄カ閸╂椽鍣緗閹稿洦鏆熼崹瀣絺鐠у嘲绱閸欐垼鎹ｅ寮㈤崺娲櫨|娴滅儤鐨敮浜呯紘搴″帗閻滅増鐪箌缂囧骸鍘撻悳浼存寬|閼辨梹甯撮崺娲櫨/g, '')
 }
 
 function scoreFundNameV3(target, candidate) {
@@ -2162,7 +2700,7 @@ function scoreFundNameV3(target, candidate) {
 function fundNameTokens(value) {
   return String(value)
     .match(/[A-Z]+|\d+|[\u4e00-\u9fa5]{2,}/g)
-    ?.filter((token) => !['鍩洪噾', '鎸囨暟', '娣峰悎', '鑲＄エ', '鍊哄埜', '鍙戣捣', '鑱旀帴'].includes(token))
+    ?.filter((token) => !['閸╂椽鍣?, '閹稿洦鏆?, '濞ｅ嘲鎮?, '閼诧紕銈?, '閸婂搫鍩?, '閸欐垼鎹?, '閼辨梹甯?].includes(token))
     .slice(0, 12) ?? []
 }
 

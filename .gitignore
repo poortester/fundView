@@ -11,6 +11,21 @@ node_modules
 dist
 dist-ssr
 *.local
+llm-settings.local.json
+local.db
+*.db
+*.sqlite
+*.sqlite3
+
+# Local workspace/tool state
+.trae/
+.agents/
+src/*.backup-*
+
+# Runtime uploads/cache
+uploads/
+tmp/
+cache/
 
 # Editor directories and files
 .vscode/*

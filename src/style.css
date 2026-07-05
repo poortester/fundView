@@ -46,3 +46,12 @@
   .bg-down { background: var(--color-bg-down); color: var(--color-down); }
   .tn { font-variant-numeric: tabular-nums; }
 }
+
+@keyframes marquee {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(-50%); }
+}
+
+.animate-marquee {
+  animation: marquee 30s linear infinite;
+}
