@@ -12,8 +12,11 @@ type Fund = {
   estimateChange: number
   positionRatio: number
   tags: string[]
+  estimateDate?: string
   estimateTime?: string
   estimateUpdatedAt?: string
+  estimateStale?: boolean
+  estimateMissing?: boolean
 }
 type Market = { code: string; name: string; value: number; change: number; source: string }
 type NewsItem = { id: string; title: string; summary: string; time: string }
@@ -485,14 +488,14 @@ function HoldingsTable({ funds, drafts, selectedFundId, query, sort, isEditing, 
           const expanded = expandedFundId === fund.id
           return (
             <div key={fund.id} className={`grid min-w-[900px] cursor-pointer grid-cols-[minmax(220px,1fr)_82px_86px_86px_110px_110px_110px_40px] items-center border-b border-zinc-100 px-3 py-2.5 last:border-b-0 ${selectedFundId === fund.id ? 'bg-blue-50/60' : 'hover:bg-zinc-50'}`} onClick={() => onSelect(fund.id)}>
-              <div className="min-w-0">
-                <div className="truncate font-semibold text-zinc-950" title={fund.name}>{fund.name}</div>
-                <div className="mt-1 truncate text-xs text-zinc-500">{fund.code} · {fund.tags.slice(0, 3).join(' / ') || '实时估值'} · {fund.estimateTime || fund.estimateUpdatedAt || '--'}</div>
-              </div>
-              <div className="text-right">
-                <div className="font-semibold tabular-nums text-zinc-950">{draft.nav.toFixed(4)}</div>
-                <div className={draft.estimateChange >= 0 ? 'text-red-500' : 'text-emerald-600'}>{formatPct(draft.estimateChange)}</div>
-              </div>
+                <div className="min-w-0">
+                  <div className="truncate font-semibold text-zinc-950" title={fund.name}>{fund.name}</div>
+                  <div className="mt-1 truncate text-xs text-zinc-500">{fund.code}</div>
+                </div>
+                <div className="text-right">
+                  <div className="font-semibold tabular-nums text-zinc-950">{draft.nav.toFixed(4)}</div>
+                  <div className={draft.estimateMissing ? 'text-zinc-400' : draft.estimateChange >= 0 ? 'text-red-500' : 'text-emerald-600'}>{draft.estimateMissing ? '0%' : formatPct(draft.estimateChange)}</div>
+                </div>
               <EditableNumber disabled={!isEditing} value={draft.shares} onChange={(value) => onPatch(fund.id, 'shares', value)} />
               <EditableNumber disabled={!isEditing} value={draft.cost} onChange={(value) => onPatch(fund.id, 'cost', value)} />
               <div className="text-right font-semibold tabular-nums text-zinc-900">{money.format(currentValue(draft))}</div>
@@ -948,7 +951,7 @@ function sortValue(fund: Fund, key: Exclude<SortKey, 'name'>) {
   return (fund.nav - fund.cost) * fund.shares
 }
 function currentValue(fund: Fund) { return fund.nav * fund.shares }
-function todayProfitValue(fund: Fund) { return currentValue(fund) * fund.estimateChange / 100 }
+function todayProfitValue(fund: Fund) { return fund.estimateMissing ? 0 : currentValue(fund) * fund.estimateChange / 100 }
 function formatMoney(value: number) { return `${value >= 0 ? '+' : ''}${money.format(value)}` }
 function formatPct(value: number) { return `${value >= 0 ? '+' : ''}${number.format(value)}%` }
 function errorMessage(error: unknown) { return error instanceof Error ? error.message : '操作失败' }
