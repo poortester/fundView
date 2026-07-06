@@ -412,10 +412,14 @@ app.use((error, _request, response, _next) => {
   response.status(error.statusCode ?? 500).json({ message: error instanceof Error ? error.message : '服务器错误' })
 })
 
-app.listen(port, '127.0.0.1', () => {
-  console.log(`API server listening on http://127.0.0.1:${port}`)
-  setInterval(() => {}, 60000)
-})
+if (process.env.VERCEL !== '1') {
+  app.listen(port, '127.0.0.1', () => {
+    console.log(`API server listening on http://127.0.0.1:${port}`)
+    setInterval(() => {}, 60000)
+  })
+}
+
+export default app
 
 function requiredEnv(name) {
   const value = process.env[name]
