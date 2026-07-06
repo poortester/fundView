@@ -1,6 +1,16 @@
 {
+  "rewrites": [
+    {
+      "source": "/api",
+      "destination": "/api/index"
+    },
+    {
+      "source": "/api/:path*",
+      "destination": "/api/index?path=:path*"
+    }
+  ],
   "functions": {
-    "api/[...path].mjs": {
+    "api/index.js": {
       "maxDuration": 30
     }
   }
