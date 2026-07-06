@@ -1,4 +1,5 @@
 import { AlertCircle, ArrowUpDown, CheckCircle2, ChevronDown, ChevronRight, RefreshCw, Save, Search, Settings2, Upload, X } from 'lucide-react'
+import type { FormEvent } from 'react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 
 type Fund = {
@@ -21,6 +22,8 @@ type Fund = {
 type Market = { code: string; name: string; value: number; change: number; source: string }
 type NewsItem = { id: string; title: string; summary: string; time: string }
 type DashboardData = { tradeDate: string; funds: Fund[]; markets: Market[]; fastNews?: NewsItem[] }
+type AuthUser = { id: string; username: string; displayName: string; role: string }
+type AuthState = { authenticated: boolean; user: AuthUser | null }
 type AgentInsight = {
   id: string
   title: string
@@ -67,6 +70,7 @@ const money = new Intl.NumberFormat('zh-CN', { style: 'currency', currency: 'CNY
 const number = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 })
 
 export default function Dashboard() {
+  const [auth, setAuth] = useState<AuthState | null>(null)
   const [data, setData] = useState<DashboardData | null>(null)
   const [selectedFundId, setSelectedFundId] = useState('')
   const [expandedFundId, setExpandedFundId] = useState('')
@@ -90,7 +94,8 @@ export default function Dashboard() {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const refreshingRef = useRef(false)
 
-  useEffect(() => { void loadDashboard() }, [])
+  useEffect(() => { void checkAuth() }, [])
+  useEffect(() => { if (auth?.authenticated) void loadDashboard() }, [auth?.authenticated])
   useEffect(() => {
     const timer = window.setInterval(() => {
       setTick((value) => value + 1)
@@ -130,6 +135,29 @@ export default function Dashboard() {
   const secondsToRefresh = nextRefreshAt ? Math.max(1, Math.ceil((nextRefreshAt - Date.now()) / 1000)) : 5
   const refreshLabel = refreshPhase === 'refreshing' ? '刷新中' : `${secondsToRefresh}s`
 
+  async function checkAuth() {
+    try {
+      const next = await requestJson<AuthState>('/api/auth/me')
+      setAuth(next)
+    } catch {
+      setAuth({ authenticated: false, user: null })
+    }
+  }
+  async function login(username: string, password: string) {
+    const next = await requestJson<AuthState>('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    })
+    setAuth(next)
+  }
+  async function logout() {
+    await requestJson<{ ok: boolean }>('/api/auth/logout', { method: 'POST' })
+    setAuth({ authenticated: false, user: null })
+    setData(null)
+    setSelectedFundId('')
+    setExpandedFundId('')
+  }
   async function loadDashboard() {
     setBusy('加载估值')
     try {
@@ -258,9 +286,13 @@ export default function Dashboard() {
     setSort((current) => current.key === key ? { key, direction: current.direction === 'asc' ? 'desc' : 'asc' } : { key, direction: 'desc' })
   }
 
+  if (!auth) return <div className="min-h-screen bg-zinc-50" />
+  if (!auth.authenticated) return <LoginScreen onLogin={login} />
+
   return (
     <div className="min-h-screen bg-zinc-50 text-zinc-950">
       <TopBar
+        user={auth.user}
         tradeDate={data?.tradeDate}
         currentTime={currentTime}
         refreshLabel={refreshLabel}
@@ -268,6 +300,7 @@ export default function Dashboard() {
         showSynced={refreshPhase === 'synced'}
         newsItems={data?.fastNews ?? []}
         onNewsClick={setSelectedNews}
+        onLogout={() => void logout()}
       />
       <main className="mx-auto max-w-[1540px] px-3 py-3">
         <div className="grid grid-cols-1 gap-3 xl:grid-cols-[minmax(860px,980px)_520px]">
@@ -317,7 +350,62 @@ export default function Dashboard() {
   )
 }
 
-function TopBar({ tradeDate, currentTime, refreshLabel, isRefreshing, showSynced, newsItems, onNewsClick }: {
+function LoginScreen({ onLogin }: { onLogin: (username: string, password: string) => Promise<void> }) {
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [message, setMessage] = useState('')
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setBusy(true)
+    setMessage('')
+    try {
+      await onLogin(username, password)
+    } catch (err) {
+      setMessage(errorMessage(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-zinc-50 px-4 text-zinc-950">
+      <form className="w-full max-w-sm rounded-lg border border-zinc-200 bg-white p-5 shadow-sm" onSubmit={submit}>
+        <div className="mb-5">
+          <h1 className="text-lg font-semibold">基金估值登录</h1>
+          <p className="mt-1 text-sm text-zinc-500">使用管理员分配的账号进入各自数据空间。</p>
+        </div>
+        <label className="block text-sm font-medium text-zinc-700">
+          账号
+          <input
+            className="mt-1 h-10 w-full rounded-md border border-zinc-200 px-3 text-sm outline-none focus:border-blue-500"
+            autoComplete="username"
+            value={username}
+            onChange={(event) => setUsername(event.target.value)}
+          />
+        </label>
+        <label className="mt-3 block text-sm font-medium text-zinc-700">
+          密码
+          <input
+            className="mt-1 h-10 w-full rounded-md border border-zinc-200 px-3 text-sm outline-none focus:border-blue-500"
+            type="password"
+            autoComplete="current-password"
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+          />
+        </label>
+        {message ? <div className="mt-3 rounded-md bg-red-50 px-3 py-2 text-sm text-red-600">{message}</div> : null}
+        <button className="mt-4 h-10 w-full rounded-md bg-zinc-950 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60" disabled={busy}>
+          {busy ? '登录中...' : '登录'}
+        </button>
+      </form>
+    </div>
+  )
+}
+
+function TopBar({ user, tradeDate, currentTime, refreshLabel, isRefreshing, showSynced, newsItems, onNewsClick, onLogout }: {
+  user: AuthUser | null
   tradeDate?: string
   currentTime: string
   refreshLabel: string
@@ -325,6 +413,7 @@ function TopBar({ tradeDate, currentTime, refreshLabel, isRefreshing, showSynced
   showSynced: boolean
   newsItems: NewsItem[]
   onNewsClick: (item: NewsItem) => void
+  onLogout: () => void
 }) {
   return (
     <header className="sticky top-0 z-40 border-b border-zinc-200 bg-white/95 backdrop-blur">
@@ -356,6 +445,12 @@ function TopBar({ tradeDate, currentTime, refreshLabel, isRefreshing, showSynced
               ))}
             </div>
           ) : <span className="text-xs text-zinc-400">暂无滚动资讯</span>}
+        </div>
+        <div className="ml-4 flex flex-none items-center gap-2">
+          <span className="max-w-[120px] truncate text-sm font-medium text-zinc-700">{user?.displayName ?? user?.username}</span>
+          <button className="h-8 rounded-md border border-zinc-200 px-2.5 text-xs font-semibold text-zinc-600 hover:bg-zinc-50" onClick={onLogout}>
+            退出
+          </button>
         </div>
       </div>
     </header>
@@ -1017,7 +1112,7 @@ function sourceLabel(source: string) {
   return labels[source] ?? source
 }
 async function requestJson<T>(url: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(url, options)
+  const response = await fetch(url, { credentials: 'same-origin', ...options })
   if (!response.ok) throw new Error((await response.json().catch(() => null))?.message ?? `请求失败：${response.status}`)
   return response.json() as Promise<T>
 }

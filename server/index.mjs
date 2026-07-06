@@ -2,6 +2,7 @@ import { createClient } from '@libsql/client'
 import { config } from 'dotenv'
 import express from 'express'
 import multer from 'multer'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { randomUUID } from 'node:crypto'
 import { readFile, writeFile } from 'node:fs/promises'
 
@@ -10,7 +11,11 @@ config({ path: '.env.local' })
 const app = express()
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } })
 const port = Number(process.env.API_PORT ?? 4001)
-const userId = 'demo-user'
+const authContext = new AsyncLocalStorage()
+const accounts = {
+  wujiacheng: { id: 'wujiacheng', username: 'wujiacheng', password: 'jijin1996', displayName: '吴家成', role: 'owner' },
+  zhaoyuqin: { id: 'zhaoyuqin', username: 'zhaoyuqin', password: 'jijin1997', displayName: '赵雨琴', role: 'member' },
+}
 const tradeDate = resolveTradeDate()
 const isChinaTradingDay = isChinaBusinessDay()
 const llmSettingsUrl = new URL('../llm-settings.local.json', import.meta.url)
@@ -23,6 +28,39 @@ const db = createClient({
 app.use(express.json({ limit: '1mb' }))
 
 app.get('/api/health', (_request, response) => response.json({ ok: true }))
+
+app.get('/api/auth/me', (request, response) => {
+  const account = accountFromRequest(request)
+  response.json({ authenticated: Boolean(account), user: account ? publicAccount(account) : null })
+})
+
+app.post('/api/auth/login', (request, response) => {
+  const username = cleanString(request.body?.username)
+  const password = String(request.body?.password ?? '')
+  const account = accounts[username]
+  if (!account || account.password !== password) {
+    return response.status(401).json({ message: '账号或密码错误' })
+  }
+  response.cookie('fundview_session', account.username, {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: process.env.VERCEL === '1',
+    path: '/',
+    maxAge: 30 * 24 * 60 * 60 * 1000,
+  })
+  response.json({ authenticated: true, user: publicAccount(account) })
+})
+
+app.post('/api/auth/logout', (_request, response) => {
+  response.clearCookie('fundview_session', { path: '/' })
+  response.json({ ok: true })
+})
+
+app.use('/api', (request, response, next) => {
+  const account = accountFromRequest(request)
+  if (!account) return response.status(401).json({ message: '请先登录' })
+  authContext.run(account, next)
+})
 
 app.get('/api/settings/llm', async (_request, response, next) => {
   try {
@@ -123,7 +161,7 @@ app.post('/api/funds', async (request, response, next) => {
                             avg_cost = excluded.avg_cost,
                             target_position_ratio = excluded.target_position_ratio,
                             updated_at = datetime('now')`,
-        args: [randomUUID(), userId, fundId, fund.shares, fund.cost, fund.positionRatio],
+        args: [randomUUID(), currentUserId(), fundId, fund.shares, fund.cost, fund.positionRatio],
       },
       fundNavStatement({
         fundId,
@@ -161,7 +199,7 @@ app.put('/api/funds/:id', async (request, response, next) => {
         sql: `UPDATE holdings
               SET shares = ?, avg_cost = ?, target_position_ratio = ?, updated_at = datetime('now')
               WHERE user_id = ? AND fund_id = ?`,
-        args: [fund.shares, fund.cost, fund.positionRatio, userId, fundId],
+        args: [fund.shares, fund.cost, fund.positionRatio, currentUserId(), fundId],
       },
       latestNavStatement(fundId, fund.nav, fund.estimateChange),
     ], 'write')
@@ -189,7 +227,7 @@ async function updateFundsBulk(request, response, next) {
         sql: `UPDATE holdings
               SET shares = ?, avg_cost = ?, target_position_ratio = ?, updated_at = datetime('now')
               WHERE user_id = ? AND fund_id = ?`,
-        args: [fund.shares, fund.cost, fund.positionRatio, userId, fund.id],
+        args: [fund.shares, fund.cost, fund.positionRatio, currentUserId(), fund.id],
       })
       statements.push(latestNavStatement(fund.id, fund.nav, fund.estimateChange))
     }
@@ -207,7 +245,7 @@ app.delete('/api/funds/:id', async (request, response, next) => {
   try {
     const fundId = request.params.id
     await db.batch([
-      { sql: `DELETE FROM holdings WHERE user_id = ? AND fund_id = ?`, args: [userId, fundId] },
+      { sql: `DELETE FROM holdings WHERE user_id = ? AND fund_id = ?`, args: [currentUserId(), fundId] },
       { sql: `DELETE FROM fund_nav_snapshots WHERE fund_id = ?`, args: [fundId] },
       { sql: `DELETE FROM funds WHERE id = ?`, args: [fundId] },
     ], 'write')
@@ -248,7 +286,7 @@ app.post('/api/holdings/import-from-ocr', async (request, response, next) => {
                               avg_cost = excluded.avg_cost,
                               target_position_ratio = excluded.target_position_ratio,
                               updated_at = datetime('now')`,
-          args: [randomUUID(), userId, resolved.shares, resolved.cost, resolved.positionRatio, 'default', resolved.code],
+          args: [randomUUID(), currentUserId(), resolved.shares, resolved.cost, resolved.positionRatio, 'default', resolved.code],
         },
       )
     }
@@ -269,7 +307,7 @@ app.put('/api/review', async (request, response, next) => {
             VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(user_id, trade_date)
             DO UPDATE SET content = excluded.content, checklist = excluded.checklist, updated_at = datetime('now')`,
-      args: [randomUUID(), userId, tradeDate, content, JSON.stringify(checklist)],
+      args: [randomUUID(), currentUserId(), tradeDate, content, JSON.stringify(checklist)],
     })
     response.json(await getDashboardData())
   } catch (error) {
@@ -425,6 +463,34 @@ function requiredEnv(name) {
   const value = process.env[name]
   if (!value) throw new Error(`Missing ${name} in .env.local`)
   return value
+}
+
+function currentAccount() {
+  const account = authContext.getStore()
+  if (!account) throw Object.assign(new Error('请先登录'), { statusCode: 401 })
+  return account
+}
+
+function currentUserId() {
+  return currentAccount().id
+}
+
+function publicAccount(account) {
+  return { id: account.id, username: account.username, displayName: account.displayName, role: account.role }
+}
+
+function accountFromRequest(request) {
+  const cookies = parseCookies(request.headers.cookie)
+  const username = cookies.fundview_session
+  return username ? accounts[username] ?? null : null
+}
+
+function parseCookies(header = '') {
+  return Object.fromEntries(String(header).split(';').map((part) => {
+    const index = part.indexOf('=')
+    if (index === -1) return ['', '']
+    return [decodeURIComponent(part.slice(0, index).trim()), decodeURIComponent(part.slice(index + 1).trim())]
+  }).filter(([key]) => key))
 }
 
 function cleanString(value) {
@@ -594,10 +660,22 @@ function fundNavStatement({ fundId, date = tradeDate, nav, estimatedNav = nav, c
 }
 
 async function ensureSeedData() {
+  const account = currentAccount()
   await db.execute({
     sql: `INSERT OR IGNORE INTO users (id, email, display_name) VALUES (?, ?, ?)`,
-    args: [userId, 'demo@local.fund', '鏈湴鐢ㄦ埛'],
+    args: [account.id, `${account.username}@local.fund`, account.displayName],
   })
+  if (account.id === 'wujiacheng') await migrateDemoUserData(account.id)
+}
+
+async function migrateDemoUserData(ownerId) {
+  const tenantTables = ['holdings', 'watchlist_items', 'review_notes', 'analysis_reports', 'trade_plans', 'trade_records']
+  for (const table of tenantTables) {
+    await db.execute({
+      sql: `UPDATE OR IGNORE ${table} SET user_id = ? WHERE user_id = 'demo-user'`,
+      args: [ownerId],
+    })
+  }
 }
 
 async function ensureMarketSnapshots() {
@@ -1912,7 +1990,7 @@ async function readFunds() {
           )
           WHERE h.user_id = ?
           ORDER BY h.created_at ASC`,
-    args: [tradeDate, isChinaTradingDay ? 1 : 0, tradeDate, isChinaTradingDay ? 1 : 0, tradeDate, userId],
+    args: [tradeDate, isChinaTradingDay ? 1 : 0, tradeDate, isChinaTradingDay ? 1 : 0, tradeDate, currentUserId()],
   })
   return result.rows.map((row) => ({
     id: String(row.fund_id),
@@ -1986,7 +2064,7 @@ async function readMarkets() {
 async function readReview() {
   const result = await db.execute({
     sql: `SELECT content, checklist FROM review_notes WHERE user_id = ? AND trade_date = ? LIMIT 1`,
-    args: [userId, tradeDate],
+    args: [currentUserId(), tradeDate],
   })
   return {
     content: String(result.rows[0]?.content ?? ''),
@@ -2001,7 +2079,7 @@ async function readLatestReportWithAdvice() {
           WHERE user_id = ?
           ORDER BY trade_date DESC, created_at DESC
           LIMIT 1`,
-    args: [userId],
+    args: [currentUserId()],
   })
   const reportRow = reportResult.rows[0]
   if (!reportRow) return null
@@ -2070,12 +2148,12 @@ async function persistAnalysisReport() {
                         market_view = excluded.market_view,
                         portfolio_view = excluded.portfolio_view,
                         updated_at = datetime('now')`,
-    args: [randomUUID(), userId, tradeDate, riskProfile, summary, marketView, analysis.agents.map((a) => `${a.role}閿?{a.view}`).join('\n')],
+    args: [randomUUID(), currentUserId(), tradeDate, riskProfile, summary, marketView, analysis.agents.map((a) => `${a.role}閿?{a.view}`).join('\n')],
   })
 
   const reportRow = await db.execute({
     sql: `SELECT id FROM analysis_reports WHERE user_id = ? AND trade_date = ? LIMIT 1`,
-    args: [userId, tradeDate],
+    args: [currentUserId(), tradeDate],
   })
   const reportId = String(reportRow.rows[0].id)
 
@@ -2139,7 +2217,7 @@ async function getAdviceStats() {
     sql: `SELECT COUNT(*) AS count FROM advice_items ai
           JOIN analysis_reports ar ON ar.id = ai.report_id
           WHERE ar.user_id = ?`,
-    args: [userId],
+    args: [currentUserId()],
   })
   const byStatus = await db.execute({
     sql: `SELECT ai.status, COUNT(*) AS count
@@ -2147,7 +2225,7 @@ async function getAdviceStats() {
           JOIN analysis_reports ar ON ar.id = ai.report_id
           WHERE ar.user_id = ?
           GROUP BY ai.status`,
-    args: [userId],
+    args: [currentUserId()],
   })
   const byLevel = await db.execute({
     sql: `SELECT ai.level, COUNT(*) AS count
@@ -2155,7 +2233,7 @@ async function getAdviceStats() {
           JOIN analysis_reports ar ON ar.id = ai.report_id
           WHERE ar.user_id = ?
           GROUP BY ai.level`,
-    args: [userId],
+    args: [currentUserId()],
   })
   const recentDays = await db.execute({
     sql: `SELECT ar.trade_date, COUNT(*) AS total,
@@ -2167,7 +2245,7 @@ async function getAdviceStats() {
           GROUP BY ar.trade_date
           ORDER BY ar.trade_date DESC
           LIMIT 14`,
-    args: [userId],
+    args: [currentUserId()],
   })
   const totalCount = Number(total.rows[0]?.count ?? 0)
   const statusMap = Object.fromEntries(byStatus.rows.map((row) => [String(row.status), Number(row.count)]))
@@ -2200,7 +2278,7 @@ async function getAttributionSummary() {
           LEFT JOIN funds f ON f.id = ai.fund_id
           WHERE ar.user_id = ? AND ai.status = 'executed' AND ai.baseline_nav IS NOT NULL AND ai.baseline_nav > 0
           ORDER BY ai.executed_at DESC`,
-    args: [userId],
+    args: [currentUserId()],
   })
   if (!rows.rows.length) return { count: 0, winCount: 0, avgReturnPct: 0, items: [] }
 
@@ -2254,7 +2332,7 @@ async function getFundAnalysisHistory(fundId) {
           WHERE ar.user_id = ? AND ai.fund_id = ?
           ORDER BY ar.trade_date DESC, ai.created_at DESC
           LIMIT 30`,
-    args: [userId, fundId],
+    args: [currentUserId(), fundId],
   })
   const latestNavRow = await db.execute({
     sql: `SELECT estimated_nav, nav
